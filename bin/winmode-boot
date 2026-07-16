@@ -4,6 +4,7 @@
 # Starts the bar (and taskbar + desktop icons) matching the
 # saved mode, so windows mode survives reboots.
 # ============================================================
+set -u
 
 # clipboard history collector (WIN+V in windows mode)
 if command -v cliphist >/dev/null 2>&1; then
@@ -13,9 +14,8 @@ if command -v cliphist >/dev/null 2>&1; then
     }
 fi
 
-# rofi app order tracks real focus/open history
+# rofi app order tracks real recent usage
 if ! pgrep -x app-recency >/dev/null 2>&1; then
-    # process name may be "python3"; fall back to a pidfile-less start
     if ! ps -u "$USER" -o args= 2>/dev/null | grep -q '[a]pp-recency daemon'; then
         setsid -f "$HOME/.local/bin/app-recency" daemon >/dev/null 2>&1
     fi
@@ -27,14 +27,4 @@ if [ -f "$HOME/.local/lib/hypr-minimize.so" ]; then
         hyprctl plugin load "$HOME/.local/lib/hypr-minimize.so" >/dev/null 2>&1 || true
 fi
 
-if [ -e "$HOME/.local/state/winmode/on" ]; then
-    setsid -f waybar \
-        -c "$HOME/.config/waybar/windows/config.jsonc" \
-        -s "$HOME/.config/waybar/windows/style.css" >/dev/null 2>&1
-    # dock must map AFTER waybar so it stacks above it (same layer)
-    sleep 1
-    setsid -f "$HOME/.local/bin/winbar-dock" >/dev/null 2>&1
-    setsid -f "$HOME/.local/bin/winbar-desk" >/dev/null 2>&1
-else
-    setsid -f waybar >/dev/null 2>&1
-fi
+exec "$HOME/.local/bin/winmode-chrome" boot

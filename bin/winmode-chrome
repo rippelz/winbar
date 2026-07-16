@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# ============================================================
+# winmode-chrome — single owner of waybar / winbar-dock /
+# winbar-desk lifecycle.
+#
+# Design goals (race-free Super+W / Super+B / boot):
+#   1. Desired state is files, not process presence:
+#        on          → winmode active (owned by winmode)
+#        bar-hidden  → Super+B suppressed taskbar
+#        gen         → invalidates in-flight delayed starts
+#   2. flock serializes state transitions only. Process kills
+#      and spawns happen OUTSIDE the lock so a slow waybar
+#      death cannot starve dock/desk starts.
+#   3. Delayed dock/desk are setsid-detached and re-check
+#      gen + desired state before mapping.
+#   4. Spawned processes never inherit the lock fd.
+# ============================================================
+set -u
+
+STATE_DIR="${HOME}/.local/state/winmode"
+ON="${STATE_DIR}/on"
+GENF="${STATE_DIR}/gen"
+HIDDEN="${STATE_DIR}/bar-hidden"
+LOCK="${STATE_DIR}/chrome.lock"
+WB_DIR="${HOME}/.config/waybar"
+WB_WIN_C="${WB_DIR}/windows/config.jsonc"
+WB_WIN_S="${WB_DIR}/windows/style.css"
+DOCK="${HOME}/.local/bin/winbar-dock"
+DESK="${HOME}/.local/bin/winbar-desk"
+SELF="${HOME}/.local/bin/winmode-chrome"
+
+mkdir -p "$STATE_DIR"
+: >> "$LOCK"
+
+win_on()  { [ -e "$ON" ]; }
+bar_hid() { [ -e "$HIDDEN" ]; }
+cur_gen() { cat "$GENF" 2>/dev/null || echo 0; }
+
+bump_gen() {
+    local g
+    g=$(( $(cur_gen) + 1 ))
+    echo "$g" > "$GENF"
+    echo "$g"
+}
+
+alive() { [ "$(cur_gen)" = "$1" ]; }
+
+# Fire-and-forget kills — never sleep under the lock.
+kill_named() {
+    pkill -x "$1" 2>/dev/null || true
+    pkill -9 -x "$1" 2>/dev/null || true
+}
+
+kill_taskbar() {
+    kill_named waybar
+    kill_named winbar-dock
+}
+
+kill_desk() {
+    kill_named winbar-desk
+}
+
+# Drop every non-stdio fd so flock's lock fd cannot leak into
+# waybar / python and pin chrome.lock forever.
+close_extra_fds() {
+    local fd
+    for fd in /proc/self/fd/*; do
+        fd="${fd##*/}"
+        case "$fd" in
+            *[!0-9]*|0|1|2) continue ;;
+        esac
+        eval "exec ${fd}>&-" 2>/dev/null || true
+    done
+}
+
+spawn() {
+    (
+        close_extra_fds
+        exec setsid "$@" </dev/null >/dev/null 2>&1
+    ) &
+}
+
+start_waybar_win() {
+    spawn waybar -c "$WB_WIN_C" -s "$WB_WIN_S"
+}
+
+start_waybar_normal() {
+    spawn waybar
+}
+
+start_dock() {
+    pgrep -x winbar-dock >/dev/null 2>&1 && return 0
+    [ -x "$DOCK" ] || return 0
+    spawn "$DOCK"
+}
+
+start_desk() {
+    pgrep -x winbar-desk >/dev/null 2>&1 && return 0
+    [ -x "$DESK" ] || return 0
+    spawn "$DESK"
+}
+
+# Fully detached: parent --inlock exits immediately after schedule;
+# without setsid, bash would SIGHUP the sleep.
+schedule() {
+    local delay="$1" gen="$2" action="$3"
+    setsid -f bash -c \
+        'sleep "$1"; exec "$2" --deferred "$3" "$4"' \
+        bash "$delay" "$SELF" "$gen" "$action" \
+        </dev/null >/dev/null 2>&1
+}
+
+# Brief exclusive section for state only.
+# Usage: locked_gen=$(with_lock bash -c '...')  — we call functions
+# via --inlock-* re-entry to keep one process model.
+with_lock() {
+    # runs: $SELF --locked-fn <fn> [args...]
+    flock -w 5 "$LOCK" "$SELF" --locked "$@"
+}
+
+# ---------- locked helpers (state only, no sleeps) ----------
+locked_enter() {
+    rm -f "$HIDDEN"
+    bump_gen
+}
+
+locked_leave() {
+    rm -f "$HIDDEN"
+    bump_gen
+}
+
+locked_hide() {
+    touch "$HIDDEN"
+    bump_gen
+}
+
+locked_show() {
+    rm -f "$HIDDEN"
+    bump_gen
+}
+
+locked_boot() {
+    rm -f "$HIDDEN"
+    bump_gen
+}
+
+locked_ensure_bump() {
+    bump_gen
+}
+
+# ---------- public commands (kill/spawn OUTSIDE lock) ----------
+do_enter() {
+    local gen
+    gen=$(with_lock enter) || return 1
+    kill_taskbar
+    kill_desk
+    # brief settle so waybar isn't racing its own old process
+    sleep 0.05
+    # Super+B / leave may have superseded us while unlocked.
+    alive "$gen" || return 0
+    if bar_hid; then
+        start_desk
+        return 0
+    fi
+    win_on || return 0
+    start_waybar_win
+    schedule 0.15 "$gen" desk
+    schedule 0.45 "$gen" dock
+}
+
+do_leave() {
+    local gen
+    gen=$(with_lock leave) || return 1
+    kill_taskbar
+    kill_desk
+    sleep 0.05
+    # If enter raced back on, don't start the normal bar.
+    alive "$gen" || return 0
+    win_on && return 0
+    start_waybar_normal
+}
+
+do_hide() {
+    if win_on; then
+        local gen
+        gen=$(with_lock hide) || return 1
+        kill_taskbar
+        sleep 0.05
+        alive "$gen" || return 0
+        win_on || return 0
+        start_desk
+        return 0
+    fi
+    kill_named waybar
+}
+
+do_show() {
+    if win_on; then
+        local gen
+        gen=$(with_lock show) || return 1
+        kill_taskbar
+        sleep 0.05
+        alive "$gen" || return 0
+        bar_hid && return 0
+        win_on || return 0
+        start_waybar_win
+        start_desk
+        schedule 0.35 "$gen" dock
+        return 0
+    fi
+    local gen
+    gen=$(with_lock show) || true
+    kill_named waybar
+    sleep 0.05
+    alive "$gen" 2>/dev/null || true
+    win_on && return 0
+    start_waybar_normal
+}
+
+do_toggle() {
+    if win_on; then
+        if bar_hid; then
+            do_show
+        else
+            do_hide
+        fi
+        return 0
+    fi
+    if pgrep -x waybar >/dev/null 2>&1; then
+        kill_named waybar
+    else
+        start_waybar_normal
+    fi
+}
+
+do_boot() {
+    local gen
+    gen=$(with_lock boot) || return 1
+    kill_taskbar
+    kill_desk
+    sleep 0.05
+    if win_on; then
+        start_waybar_win
+        schedule 0.20 "$gen" desk
+        schedule 0.55 "$gen" dock
+    else
+        start_waybar_normal
+    fi
+}
+
+do_ensure() {
+    if bar_hid; then
+        if win_on; then
+            start_desk
+            pgrep -x waybar >/dev/null 2>&1 && kill_named waybar
+            pgrep -x winbar-dock >/dev/null 2>&1 && kill_named winbar-dock
+        fi
+        return 0
+    fi
+
+    if win_on; then
+        local need_dock=0
+        if ! pgrep -x waybar >/dev/null 2>&1; then
+            start_waybar_win
+            need_dock=1
+        fi
+        start_desk
+        if [ "$need_dock" -eq 1 ] || ! pgrep -x winbar-dock >/dev/null 2>&1; then
+            local gen
+            gen=$(with_lock ensure_bump) || return 1
+            schedule 0.35 "$gen" dock
+        fi
+    else
+        kill_named winbar-dock
+        kill_named winbar-desk
+        pgrep -x waybar >/dev/null 2>&1 || start_waybar_normal
+    fi
+}
+
+# Deferred: re-validate under a short lock, spawn outside.
+run_deferred() {
+    local gen="$1" action="$2"
+    local ok=0
+
+    # State check under lock (no process waits).
+    if ! flock -w 2 "$LOCK" bash -c '
+        set -u
+        GENF="'"$GENF"'"; ON="'"$ON"'"; HIDDEN="'"$HIDDEN"'"
+        [ "$(cat "$GENF" 2>/dev/null || echo 0)" = "'"$gen"'" ] || exit 1
+        [ -e "$ON" ] || exit 1
+        case "'"$action"'" in
+            dock) [ ! -e "$HIDDEN" ] || exit 1 ;;
+            desk) ;;
+            *) exit 1 ;;
+        esac
+        exit 0
+    '; then
+        return 0
+    fi
+
+    case "$action" in
+        desk)
+            start_desk
+            ;;
+        dock)
+            pgrep -x waybar >/dev/null 2>&1 || return 0
+            # Restart dock so it stacks above waybar on overlay.
+            kill_named winbar-dock
+            sleep 0.05
+            # Re-check after sleep — Super+B may have fired.
+            alive "$gen" || return 0
+            win_on || return 0
+            bar_hid && return 0
+            pgrep -x waybar >/dev/null 2>&1 || return 0
+            start_dock
+            ;;
+    esac
+}
+
+# ---------- entry ----------
+if [ "${1:-}" = "--locked" ]; then
+    fn="${2:-}"
+    case "$fn" in
+        enter)       locked_enter ;;
+        leave)       locked_leave ;;
+        hide)        locked_hide ;;
+        show)        locked_show ;;
+        boot)        locked_boot ;;
+        ensure_bump) locked_ensure_bump ;;
+        *) exit 2 ;;
+    esac
+    exit 0
+fi
+
+if [ "${1:-}" = "--deferred" ]; then
+    run_deferred "${2:-}" "${3:-}"
+    exit 0
+fi
+
+cmd="${1:-}"
+case "$cmd" in
+    enter|leave|toggle|hide|show|boot|ensure) ;;
+    *)
+        echo "usage: winmode-chrome {enter|leave|toggle|hide|show|boot|ensure}" >&2
+        exit 2
+        ;;
+esac
+
+"do_${cmd}"

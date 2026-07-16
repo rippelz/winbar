@@ -13,7 +13,7 @@ mkdir -p "$BIN" "$SHARE" "$HYPR" "$STATE" \
 
 echo "==> Installing scripts → $BIN"
 for s in winbar-dock winbar-desk winbar-msg winbar-emoji winbar-clip \
-         winbar-minimize winmode winmode-boot toggle-waybar rofi-apps; do
+         winbar-minimize winmode winmode-boot winmode-chrome toggle-waybar rofi-apps; do
     install -m 755 "$ROOT/bin/$s" "$BIN/$s"
 done
 ln -sfn winbar-msg "$BIN/winbar-alttab"

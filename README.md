@@ -10,6 +10,7 @@ Windows-style desktop mode for [Hyprland](https://hyprland.org/): bottom taskbar
 | `winbar-desk` | Per-monitor desktop icons |
 | `winbar-msg` | IPC to dock (start / alt-tab / taskview / minimize / …) |
 | `toggle-waybar` | `Super+B` hide/show bar; in winmode also dock icons |
+| `winmode-chrome` | Shared chrome lifecycle (lock + gen + bar-hidden) |
 | `plugin/` | `hypr-minimize` titlebar minimize → dock |
 
 ## Install
