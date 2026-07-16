@@ -36,15 +36,18 @@ install_if_missing "$ROOT/config/waybar/windows/config.jsonc" \
     "$CFG/waybar/windows/config.jsonc"
 install_if_missing "$ROOT/config/waybar/windows/style.css" \
     "$CFG/waybar/windows/style.css"
+# Always refresh shipped rofi templates (palette is re-applied by `theme apply`)
+echo "==> rofi templates → $CFG/rofi"
 for f in winmode-list.rasi winmode-search.rasi winmode-start.rasi; do
-    install_if_missing "$ROOT/config/rofi/$f" "$CFG/rofi/$f"
+    if [ -f "$ROOT/config/rofi/$f" ]; then
+        install -m 644 "$ROOT/config/rofi/$f" "$CFG/rofi/$f"
+        echo "  $f"
+    fi
 done
 if [ -f "$ROOT/config/rofi/winmode-recent.sh" ]; then
-    if [ ! -e "$CFG/rofi/winmode-recent.sh" ]; then
-        install -m 755 "$ROOT/config/rofi/winmode-recent.sh" \
-            "$CFG/rofi/winmode-recent.sh"
-        echo "  created $CFG/rofi/winmode-recent.sh"
-    fi
+    install -m 755 "$ROOT/config/rofi/winmode-recent.sh" \
+        "$CFG/rofi/winmode-recent.sh"
+    echo "  winmode-recent.sh"
 fi
 install_if_missing "$ROOT/config/winbar/theme.css" "$CFG/winbar/theme.css"
 install_if_missing "$ROOT/config/winbar/night-red.glsl" \
