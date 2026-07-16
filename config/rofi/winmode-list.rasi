@@ -4,7 +4,7 @@
    menu theme, so `theme apply` restyles this automatically.
    ============================================================ */
 
-@import "/home/beebit/.config/rofi/winmode-start.rasi"
+@import "winmode-start.rasi"
 
 configuration {
     modi: "drun";

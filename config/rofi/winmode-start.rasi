@@ -4,7 +4,7 @@
 
 configuration {
     modi: "combi";
-    combi-modi: "drun,recent:/home/beebit/.config/rofi/winmode-recent.sh";
+    combi-modi: "drun,recent:~/.config/rofi/winmode-recent.sh";
     combi-hide-mode-prefix: true;
     show-icons: true;
     icon-theme: "Papirus";
