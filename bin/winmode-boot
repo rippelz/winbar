@@ -14,9 +14,13 @@ if command -v cliphist >/dev/null 2>&1; then
     }
 fi
 
-# rofi app order tracks real recent usage
-if ! pgrep -x app-recency >/dev/null 2>&1; then
-    if ! ps -u "$USER" -o args= 2>/dev/null | grep -q '[a]pp-recency daemon'; then
+# rofi app order tracks real recent usage (respect hyprmods install state)
+_app_recency_wanted=1
+if command -v hyprmods >/dev/null 2>&1; then
+    hyprmods check app-recency >/dev/null 2>&1 || _app_recency_wanted=0
+fi
+if [ "$_app_recency_wanted" -eq 1 ] && [ -x "$HOME/.local/bin/app-recency" ]; then
+    if ! pgrep -f '[a]pp-recency' >/dev/null 2>&1; then
         setsid -f "$HOME/.local/bin/app-recency" daemon >/dev/null 2>&1
     fi
 fi
