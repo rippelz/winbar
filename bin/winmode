@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# ============================================================
+# winmode — toggle between normal Hyprland and a Windows-style
+# desktop (bottom taskbar + start menu + desktop icons).
+#
+# On:  writes overrides into ~/.config/hypr/mode.conf, swaps
+#      waybar to the windows bar, starts the winbar-dock taskbar
+#      and winbar-desk desktop icons.
+# Off: empties mode.conf, restores your normal waybar. Your base
+#      hyprland.conf is never modified.
+#
+# Spam-safe: a generation counter invalidates delayed dock/desk
+# starts if you flip back to normal before they finish.
+# ============================================================
+set -u
+
+STATE_DIR="$HOME/.local/state/winmode"
+STATE="$STATE_DIR/on"
+GENF="$STATE_DIR/gen"
+MODE_CONF="$HOME/.config/hypr/mode.conf"
+WB_DIR="$HOME/.config/waybar"
+
+mkdir -p "$STATE_DIR"
+
+# Every toggle bumps this. Stale delayed starts see a mismatch and quit.
+gen=$(( $(cat "$GENF" 2>/dev/null || echo 0) + 1 ))
+echo "$gen" > "$GENF"
+
+restart_waybar() {
+    pkill -x waybar 2>/dev/null || true
+    for _ in $(seq 20); do
+        pgrep -x waybar >/dev/null || break
+        sleep 0.05
+    done
+    setsid -f waybar "$@" >/dev/null 2>&1
+}
+
+kill_chrome() {
+    pkill -x winbar-dock 2>/dev/null || true
+    pkill -x winbar-desk 2>/dev/null || true
+    for _ in $(seq 20); do
+        pgrep -x winbar-dock >/dev/null || pgrep -x winbar-desk >/dev/null || break
+        sleep 0.05
+    done
+    pkill -9 -x winbar-dock 2>/dev/null || true
+    pkill -9 -x winbar-desk 2>/dev/null || true
+}
+
+if [ -e "$STATE" ]; then
+    # ---------- OFF → normal Hyprland ----------
+    "$HOME/.local/bin/winbar-minimize" restore-all >/dev/null 2>&1 || true
+    rm -f "$STATE"
+
+    cat > "$MODE_CONF" <<'EOF'
+# Managed by ~/.local/bin/winmode — currently OFF (no overrides).
+EOF
+
+    hyprctl reload >/dev/null 2>&1
+    kill_chrome
+    restart_waybar
+else
+    # ---------- ON → Windows-style desktop ----------
+    # infini + winmode chrome fight (Super+F bar/icons). Leave canvas first.
+    if [ -e "$HOME/.local/state/infiniscroll/on" ]; then
+        "$HOME/.local/bin/infiniscroll" >/dev/null 2>&1 || true
+    fi
+
+    touch "$STATE"
+
+    if [ -f "$HOME/.local/lib/hypr-minimize.so" ]; then
+        hyprctl plugin list 2>/dev/null | grep -q 'hypr-minimize' || \
+            hyprctl plugin load "$HOME/.local/lib/hypr-minimize.so" >/dev/null 2>&1 || true
+    fi
+
+    cat > "$MODE_CONF" <<'EOF'
+# ============================================================
+# WINDOWS MODE overrides — managed by ~/.local/bin/winmode.
+# This file is emptied when windows mode is toggled off.
+# ============================================================
+
+# Edge snapping while dragging floating windows
+general:snap:enabled = true
+
+
+# ALT+TAB switcher with window previews (winbar-dock overlay):
+# Tab cycles (hold Tab to keep cycling), releasing Alt focuses the
+# selection, Esc cancels.
+binde = ALT, TAB, exec, ~/.local/bin/winbar-msg next
+binde = ALT SHIFT, TAB, exec, ~/.local/bin/winbar-msg prev
+bindrt = ALT, ALT_L, exec, ~/.local/bin/winbar-msg commit
+bindrt = ALT SHIFT, ALT_L, exec, ~/.local/bin/winbar-msg commit
+bindrt = ALT, ALT_R, exec, ~/.local/bin/winbar-msg commit
+bindrt = ALT SHIFT, ALT_R, exec, ~/.local/bin/winbar-msg commit
+bind = ALT, ESCAPE, exec, ~/.local/bin/winbar-msg cancel
+
+# WIN+TAB task view (all workspaces overview)
+bind = SUPER, TAB, exec, ~/.local/bin/winbar-msg taskview
+
+# WIN+. emoji picker (WIN+V stays as togglefloating from the base config)
+bind = SUPER, period, exec, ~/.local/bin/winbar-emoji
+
+# WIN+R opens the start menu while in windows mode
+unbind = SUPER, R
+bind = SUPER, R, exec, ~/.local/bin/winbar-msg start
+
+# Super+M minimizes / restores the active window (titlebar minimize also
+# works via the hypr-minimize plugin → winbar-dock). Only bound in winmode.
+bind = SUPER, M, exec, ~/.local/bin/winbar-msg minimize
+EOF
+
+    hyprctl reload >/dev/null 2>&1
+    restart_waybar -c "$WB_DIR/windows/config.jsonc" -s "$WB_DIR/windows/style.css"
+
+    # dock after waybar for z-order; abort if user already left winmode
+    (
+        sleep 0.6
+        [[ -e "$STATE" ]] || exit 0
+        [[ "$(cat "$GENF" 2>/dev/null)" == "$gen" ]] || exit 0
+
+        setsid -f "$HOME/.local/bin/winbar-dock" >/dev/null 2>&1
+
+        [[ -e "$STATE" ]] || { kill_chrome; exit 0; }
+        [[ "$(cat "$GENF" 2>/dev/null)" == "$gen" ]] || { kill_chrome; exit 0; }
+
+        setsid -f "$HOME/.local/bin/winbar-desk" >/dev/null 2>&1
+    ) &
+fi

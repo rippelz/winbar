@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+# winbar-msg — send a command to the running winbar-dock.
+#   next | prev | commit | cancel   (alt-tab switcher)
+#   taskview                        (WIN+TAB overview)
+#   quick                           (quick settings panel)
+#   tray                            (tray overflow popup)
+#   start                           (start menu w/ click-off backdrop)
+# Falls back to plain hyprland cycling / bare rofi if the dock
+# isn't running.
+import os
+import socket
+import subprocess
+import sys
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else 'next'
+sock_path = os.path.join(
+    os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'),
+    'winbar-dock.sock')
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.sendto(cmd.encode(), sock_path)
+except OSError:
+    if cmd == 'next':
+        subprocess.run(['hyprctl', 'dispatch', 'cyclenext'])
+        subprocess.run(['hyprctl', 'dispatch', 'alterzorder', 'top'])
+    elif cmd == 'prev':
+        subprocess.run(['hyprctl', 'dispatch', 'cyclenext', 'prev'])
+        subprocess.run(['hyprctl', 'dispatch', 'alterzorder', 'top'])
+    elif cmd == 'start':
+        subprocess.Popen(
+            [os.path.expanduser('~/.local/bin/rofi-apps'),
+             '-show', 'combi', '-theme',
+             os.path.expanduser('~/.config/rofi/winmode-start.rasi')])
+    # minimize has no sensible fallback outside winmode / dock

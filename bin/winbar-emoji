@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+# winbar-emoji — WIN+. emoji picker (windows mode).
+# Generates its emoji list once from unicodedata, shows a themed
+# rofi menu, copies the chosen emoji to the clipboard.
+import os
+import subprocess
+import unicodedata
+
+LIST = os.path.expanduser('~/.local/share/winbar/emoji.txt')
+RANGES = [
+    (0x1F600, 0x1F64F),   # smileys
+    (0x1F900, 0x1F9FF),   # supplemental (hearts, faces, people)
+    (0x1FA70, 0x1FAFF),   # extended-A
+    (0x1F300, 0x1F5FF),   # misc symbols & pictographs
+    (0x1F680, 0x1F6FF),   # transport
+    (0x2600, 0x26FF),     # misc symbols
+    (0x2700, 0x27BF),     # dingbats
+]
+
+if not os.path.exists(LIST):
+    os.makedirs(os.path.dirname(LIST), exist_ok=True)
+    with open(LIST, 'w') as f:
+        for a, b in RANGES:
+            for cp in range(a, b + 1):
+                ch = chr(cp)
+                try:
+                    name = unicodedata.name(ch).lower()
+                except ValueError:
+                    continue
+                f.write(f'{ch}  {name}\n')
+
+with open(LIST) as f:
+    r = subprocess.run(
+        ['rofi', '-dmenu', '-i', '-p', 'emoji', '-theme',
+         os.path.expanduser('~/.config/rofi/winmode-list.rasi')],
+        stdin=f, capture_output=True, text=True)
+
+sel = r.stdout.strip()
+if sel:
+    subprocess.run(['wl-copy'], input=sel.split()[0], text=True)

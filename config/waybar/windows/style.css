@@ -1,0 +1,143 @@
+/* ============================================================
+   WINDOWS MODE taskbar style — themed: Lavender
+   Palette block below is swapped per-theme by `theme apply`.
+   ============================================================ */
+
+/* ---- PALETTE ---- */
+@define-color win-bg       rgba(16, 14, 24, 0.94);
+@define-color win-edge     rgba(183, 148, 246, 0.16);
+@define-color win-fg       #ebe6f4;
+@define-color win-sub      #d0c8dc;
+@define-color win-dim      #9a92a8;
+@define-color win-accent   #b794f6;
+@define-color win-accent2  #c4a1ff;
+@define-color win-hover    rgba(183, 148, 246, 0.12);
+@define-color win-pill-bg  rgba(183, 148, 246, 0.08);
+@define-color win-pill-br  rgba(183, 148, 246, 0.18);
+@define-color win-menu-bg  rgba(22, 19, 31, 0.98);
+@define-color win-menu-br  rgba(183, 148, 246, 0.22);
+
+* {
+	font-family: "Noto Sans", "Commit Mono Nerd Font", sans-serif;
+	font-size: 13px;
+	min-height: 0;
+	border: none;
+	border-radius: 0;
+}
+
+window#waybar {
+	background: @win-bg;
+	border-top: 1px solid @win-edge;
+	color: @win-fg;
+}
+
+tooltip {
+	background: @win-menu-bg;
+	border: 1px solid @win-menu-br;
+	border-radius: 8px;
+}
+tooltip label {
+	color: @win-fg;
+}
+
+/* ---- start button (square) ---- */
+#custom-start {
+	font-family: "Commit Mono Nerd Font";
+	font-size: 19px;
+	color: @win-accent;
+	min-width: 38px;
+	padding: 0;
+	margin: 5px 3px 5px 6px;
+	border-radius: 7px;
+}
+#custom-start:hover {
+	background: @win-hover;
+}
+
+/* ---- search pill ---- */
+#custom-search {
+	background: @win-pill-bg;
+	border: 1px solid @win-pill-br;
+	border-radius: 999px;
+	color: @win-dim;
+	padding: 0 72px 0 14px;
+	margin: 9px 10px 9px 4px;
+}
+#custom-search:hover {
+	background: @win-hover;
+	color: @win-fg;
+}
+
+/* ---- right cluster ---- */
+#tray {
+	padding: 0 8px;
+	margin: 5px 2px;
+	border-radius: 7px;
+}
+#tray menu {
+	background: @win-menu-bg;
+	border: 1px solid @win-menu-br;
+	border-radius: 8px;
+	color: @win-fg;
+}
+
+#custom-hyprmode {
+	font-family: "Commit Mono Nerd Font";
+	font-size: 17px;
+	color: @win-accent2;
+	padding: 0 10px;
+	margin: 5px 2px;
+	border-radius: 7px;
+}
+#custom-hyprmode:hover {
+	background: @win-hover;
+}
+
+#network,
+#pulseaudio {
+	font-family: "Commit Mono Nerd Font";
+	font-size: 15px;
+	color: @win-sub;
+	padding: 0 8px;
+	margin: 5px 0;
+	border-radius: 7px;
+}
+#network:hover,
+#pulseaudio:hover {
+	background: @win-hover;
+}
+
+#clock {
+	font-size: 11.5px;
+	color: @win-sub;
+	padding: 0 10px;
+	margin: 5px 2px;
+	border-radius: 7px;
+}
+#clock:hover {
+	background: @win-hover;
+}
+
+/* ---- tray overflow chevron ---- */
+#custom-chevron {
+	font-family: "Commit Mono Nerd Font";
+	font-size: 12px;
+	color: @win-sub;
+	padding: 0 7px;
+	margin: 5px 0 5px 2px;
+	border-radius: 7px;
+}
+#custom-chevron:hover {
+	background: @win-hover;
+	color: @win-fg;
+}
+
+/* ---- show desktop sliver ---- */
+#custom-showdesktop {
+	border-left: 1px solid @win-edge;
+	padding: 0 3px;
+	margin: 12px 0 12px 4px;
+}
+#custom-showdesktop:hover {
+	background: @win-hover;
+}

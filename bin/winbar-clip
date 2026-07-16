@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# winbar-clip — WIN+V clipboard history (windows mode).
+# Needs cliphist (pacman -S cliphist) + the wl-paste watcher
+# started by winmode-boot.
+set -u
+
+if ! command -v cliphist >/dev/null 2>&1; then
+    rofi -e "Clipboard history needs cliphist — run:  sudo pacman -S cliphist"
+    exit 1
+fi
+
+sel="$(cliphist list | rofi -dmenu -i -p clip \
+        -theme "$HOME/.config/rofi/winmode-list.rasi")" || exit 0
+[ -n "$sel" ] && printf '%s' "$sel" | cliphist decode | wl-copy

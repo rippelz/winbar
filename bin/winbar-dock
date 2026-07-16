@@ -1,0 +1,2511 @@
+#!/usr/bin/env python3
+# ============================================================
+# winbar-dock — Windows-style grouped taskbar for Hyprland.
+#
+# Sits on top of the winmode waybar (which reserves the space
+# and draws the background) and provides the app area:
+#   - pinned + running apps merged (no duplicates)
+#   - indicator underline: none = pinned only, grey = running,
+#     blue = focused; count badge when multiple windows
+#   - left click:  launch / focus / window picker
+#   - hover:       thumbnail preview popup, centered above icon
+#   - right click: pin / unpin / new window / close
+#   - hold + drag icons left/right to reorder (icons shuffle
+#     live under the cursor; pinned order persists)
+#   - hides while a window is fullscreen on its monitor
+#
+# Thumbnails: whenever a window gains focus it is snapshotted
+# with grim (scaled jpeg, atomic rename) into
+# ~/.cache/winbar/thumbs so previews show real window content.
+#
+# Pinned apps: ~/.config/winbar/pinned.json (list of .desktop ids)
+# ============================================================
+
+import ctypes
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import urllib.request
+
+# name the process so pgrep/pkill -x winbar-dock works
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    libc.prctl(15, b'winbar-dock', 0, 0, 0)  # PR_SET_NAME
+except Exception:
+    pass
+
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import (Gtk, Gdk, GLib, Gio, GdkPixbuf,  # noqa: E402
+                           GtkLayerShell, Pango)
+
+MARGIN_LEFT = 205          # px, sits right after the search pill
+BAR_HEIGHT = 48
+ICON_SIZE = 26
+THUMB_W, THUMB_H = 208, 122
+DRAG_THRESHOLD = 8         # px before a press becomes a reorder-drag
+# shrink / unshrink toward the taskbar icon (ms). Keep in sync with
+# decoration windowsMove speed in hyprland.conf (~3 → ~300ms feel).
+MIN_ANIM_MS = 280
+MIN_ANIM_SIZE = 52         # px square when parked on the icon
+
+CONFIG_DIR = os.path.expanduser('~/.config/winbar')
+PINNED_FILE = os.path.join(CONFIG_DIR, 'pinned.json')
+THUMB_DIR = os.path.expanduser('~/.cache/winbar/thumbs')
+RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
+CTRL_SOCK = os.path.join(RUNTIME_DIR, 'winbar-dock.sock')
+TRAY_FILE = os.path.join(CONFIG_DIR, 'tray-apps.json')
+ART_DIR = os.path.expanduser('~/.cache/winbar/art')
+DEFAULT_TRAY = ['com.obsproject.Studio.desktop']
+MINIMIZED_WS = 'special:minimized'
+MINIMIZED_FILE = os.path.expanduser('~/.local/state/winmode/minimized.json')
+
+# start menu: rofi 2.0's wayland backend has no click-to-exit
+# (temp_click_to_exit is NULL there), so the dock provides the
+# click-off backdrop and spawns rofi on top of it.
+ROFI_CMD = [os.path.expanduser('~/.local/bin/rofi-apps'),
+            '-show', 'combi', '-theme',
+            os.path.expanduser('~/.config/rofi/winmode-start.rasi')]
+
+# night light: click cycles the steps, right-click jumps to Off.
+# Temperature steps run hyprsunset; the last step is a Hyprland
+# screen shader that maps luminance to pure red.
+NIGHT_STATE = os.path.join(CONFIG_DIR, 'night-step')
+NIGHT_SHADER = os.path.join(CONFIG_DIR, 'night-red.glsl')
+NIGHT_STEPS = [
+    ('Off', None),
+    ('4200K', 4200),
+    ('3000K', 3000),
+    ('2200K', 2200),
+    ('1200K', 1200),
+    ('Red', 'red'),
+]
+NIGHT_SHADER_SRC = """#version 300 es
+precision highp float;
+in vec2 v_texcoord;
+out vec4 fragColor;
+uniform sampler2D tex;
+void main() {
+    vec4 c = texture(tex, v_texcoord);
+    float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+    fragColor = vec4(lum, 0.0, 0.0, c.a);
+}
+"""
+DEFAULT_PINNED = [
+    'waterfox.desktop',
+    'org.kde.dolphin.desktop',
+    'discord.desktop',
+    'steam.desktop',
+    'spotify.desktop',
+    'Alacritty.desktop',
+]
+
+CSS = b"""
+window { background: transparent; }
+button.appbtn {
+    border-radius: 7px;
+    padding: 2px 8px 0 8px;
+    margin: 5px 1px;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    min-width: 0;
+    min-height: 0;
+}
+button.appbtn:hover { background: rgba(255,255,255,0.09); }
+button.appbtn.active-app { background: rgba(255,255,255,0.11); }
+button.appbtn.minimized-app { opacity: 0.55; }
+.ind { border-radius: 2px; background: transparent; }
+.ind.running { background: #8a93a5; }
+.ind.active  { background: #6cb8ff; }
+.ind.minimized { background: #5a6270; }
+.badge {
+    background: #6cb8ff;
+    color: #10131a;
+    border-radius: 8px;
+    font-size: 9px;
+    font-weight: bold;
+    padding: 0 4px;
+    margin: 2px;
+}
+.previewcard {
+    background: rgba(24,26,33,0.98);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px;
+}
+.previewcard label { color: #e8eaf0; }
+button.wincard {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 9px;
+    padding: 6px;
+    box-shadow: none;
+}
+button.wincard:hover {
+    background: rgba(255,255,255,0.10);
+    border: 1px solid rgba(255,255,255,0.14);
+}
+button.wincard.altsel {
+    background: rgba(108,184,255,0.22);
+    border: 1px solid #6cb8ff;
+}
+flowboxchild { background: transparent; padding: 0; }
+.cardtitle { font-size: 11.5px; }
+.cardclose {
+    color: #9aa3b2;
+    border-radius: 5px;
+    padding: 0 5px;
+    font-size: 12px;
+}
+.cardclose:hover { color: #ffffff; background: rgba(255,80,80,0.35); }
+.thumbframe {
+    border-radius: 6px;
+    background: rgba(0,0,0,0.35);
+}
+menu, .menu {
+    background: rgba(28,30,38,0.98);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px; color: #e8eaf0;
+}
+menu menuitem:hover, .menu menuitem:hover { background: rgba(255,255,255,0.10); }
+
+/* ---- quick settings ---- */
+.qstitle { color: #e8eaf0; font-size: 12.5px; font-weight: bold; }
+.qsdim   { color: #9aa3b2; font-size: 11px; }
+.qsbtn {
+    font-family: "Commit Mono Nerd Font";
+    font-size: 15px;
+    color: #e8eaf0;
+    background: rgba(255,255,255,0.06);
+    border: none; box-shadow: none;
+    border-radius: 8px;
+    padding: 4px 10px;
+    min-height: 0; min-width: 0;
+}
+.qsbtn:hover { background: rgba(255,255,255,0.13); }
+.qsbtn.on { background: #6cb8ff; color: #10131a; }
+.qsart { border-radius: 8px; background: rgba(0,0,0,0.35); }
+scale { padding: 0; }
+scale trough {
+    background: rgba(255,255,255,0.14);
+    border-radius: 4px;
+    min-height: 6px;
+    border: none;
+}
+scale highlight { background: #6cb8ff; border-radius: 4px; }
+scale slider {
+    background: #e8eaf0;
+    border-radius: 99px;
+    min-width: 14px; min-height: 14px;
+    border: none; box-shadow: none;
+}
+
+/* ---- tray overflow popup ---- */
+button.traybtn {
+    background: transparent; border: none; box-shadow: none;
+    border-radius: 8px; padding: 7px;
+    min-width: 0; min-height: 0;
+}
+button.traybtn:hover { background: rgba(255,255,255,0.10); }
+.traylabel { color: #9aa3b2; font-size: 11px; }
+
+/* ---- task view ---- */
+.tvbackdrop { background: rgba(0,0,0,0.35); }
+.tvheader { color: #ffffff; font-weight: bold; font-size: 13px; }
+"""
+
+
+def hyprctl(*args, want_json=False):
+    cmd = ['hyprctl'] + (['-j'] if want_json else []) + list(args)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        return json.loads(out) if want_json else out
+    except Exception:
+        return [] if want_json else ''
+
+
+def dispatch(*args):
+    hyprctl('dispatch', *args)
+
+
+def desktop_info(desktop_id):
+    """Gio.DesktopAppInfo.new that returns None instead of raising."""
+    try:
+        return Gio.DesktopAppInfo.new(desktop_id)
+    except TypeError:
+        return None
+
+
+def thumb_path(addr):
+    return os.path.join(THUMB_DIR, addr.replace('0x', '') + '.jpg')
+
+
+def norm_addr(addr):
+    """Normalize hyprland window addresses to 0x... form."""
+    if not addr:
+        return None
+    a = str(addr).strip()
+    if a.startswith('0x') or a.startswith('0X'):
+        return '0x' + a[2:]
+    return '0x' + a
+
+
+def is_minimized_ws(ws):
+    if not isinstance(ws, dict):
+        return False
+    name = ws.get('name') or ''
+    return name == MINIMIZED_WS or name.endswith(':minimized')
+
+
+class AppResolver:
+    """class name -> Gio.DesktopAppInfo (cached)"""
+
+    def __init__(self):
+        self.cache = {}
+        self.by_wmclass = {}
+        self.by_exec = {}
+        for info in Gio.DesktopAppInfo.get_all():
+            wmc = info.get_startup_wm_class()
+            if wmc:
+                self.by_wmclass.setdefault(wmc.lower(), info)
+            exe = info.get_executable()
+            if exe:
+                self.by_exec.setdefault(os.path.basename(exe).lower(), info)
+
+    def resolve(self, cls):
+        if cls in self.cache:
+            return self.cache[cls]
+        info = None
+        for cand in (cls, cls.lower(), cls.capitalize()):
+            info = desktop_info(cand + '.desktop')
+            if info:
+                break
+        if not info:
+            info = self.by_wmclass.get(cls.lower())
+        if not info:
+            info = self.by_exec.get(cls.lower())
+        self.cache[cls] = info
+        return info
+
+
+class Dock(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='winbar-dock')
+        self.resolver = AppResolver()
+        self.active_addr = None
+        self.pinned = self.load_pinned()
+        self.order = []            # display order of group keys
+        self.buttons = {}          # key -> Gtk.Button
+        self.groups = {}
+        self.clients_by_addr = {}
+
+        # preview window (single, managed)
+        self.preview = None
+        self.preview_box = None
+        self.pop_key = None
+        self.fill_sig = None
+        self.over_button = False
+        self.over_pop = False
+        self.hover_timer = None
+        self.hide_timer = None
+        self.thumb_cache = {}      # addr -> (mtime, scaled pixbuf)
+
+        # manual drag-reorder state
+        self.press_key = None
+        self.press_x = 0
+        self.drag_active = False
+
+        self.thumb_timer = None
+        self.capture_proc = None
+        self.capture_addr = None
+        self.refresh_pending = False
+
+        # alt-tab switcher state
+        self.att_win = None
+        self.att_box = None
+        self.att_list = []
+        self.att_cards = []
+        self.att_sel = 0
+
+        # tray overflow (hide-to-tray apps)
+        self.tray_apps = self.load_tray()
+        self.tray_groups = {}
+        self.tray_pop = None
+        self.tray_box = None
+
+        # quick settings panel
+        self.qs_win = None
+        self.qs_panel = None
+        self.qs_timer = None
+        self.qs_setting = False   # guard: slider updated by code, not user
+        self.qs_widgets = {}
+        self.art_cache = {}       # url -> pixbuf
+        self.night_step = self._night_load()
+
+        # start menu (rofi + click-off backdrop)
+        self.start_win = None
+        self.start_timer = None
+
+        # task view overlay
+        self.tv_win = None
+        self.tv_box = None
+
+        # minimized windows: addr -> {workspace, ws_name}
+        self.minimized = self.load_minimized()
+
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(MINIMIZED_FILE), exist_ok=True)
+        for f in os.listdir(THUMB_DIR):   # stale thumbs from last session
+            try:
+                os.unlink(os.path.join(THUMB_DIR, f))
+            except OSError:
+                pass
+
+        # dock's monitor (leftmost/primary) geometry
+        self.mon_id = 0
+        self.mon_x = 0
+        self.mon_y = 0
+        self.mon_w = 2560
+        self.mon_h = 1440
+        # addr -> {dir: 'min'|'rest', timers: [id...], meta: dict, focus: bool}
+        self._anim = {}
+        self._last_anim_addr = None  # Super+M spam reverses this mid-flight
+        # nestable guard: freeze cursor warps while windows fly to the bar
+        self._warp_guard = 0
+        for m in hyprctl('monitors', want_json=True) or []:
+            if m.get('x') == 0 and m.get('y') == 0:
+                self.mon_id = m.get('id', 0)
+                self.mon_x = m.get('x', 0)
+                self.mon_y = m.get('y', 0)
+                self.mon_w = m.get('width', 2560)
+                self.mon_h = m.get('height', 1440)
+                break
+
+        # --- layer shell setup ---
+        # OVERLAY (same as winmode waybar): icons must paint above the
+        # bar strip. Mapped after waybar so within-layer z-order wins.
+        LS = GtkLayerShell
+        LS.init_for_window(self)
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        LS.set_anchor(self, LS.Edge.LEFT, True)
+        LS.set_anchor(self, LS.Edge.BOTTOM, True)
+        LS.set_margin(self, LS.Edge.LEFT, MARGIN_LEFT)
+        LS.set_exclusive_zone(self, -1)  # overlap the waybar strip
+        LS.set_namespace(self, 'winbar-dock')
+        display = Gdk.Display.get_default()
+        self.gdk_mon = display.get_monitor_at_point(0, 0)
+        if self.gdk_mon:
+            LS.set_monitor(self, self.gdk_mon)
+
+        # --- transparency ---
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.set_app_paintable(True)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # per-theme color overrides, swapped by `theme apply`
+        theme_css = os.path.expanduser('~/.config/winbar/theme.css')
+        if os.path.exists(theme_css):
+            try:
+                tp = Gtk.CssProvider()
+                tp.load_from_path(theme_css)
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen, tp, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            except Exception:
+                pass
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.box.set_size_request(-1, BAR_HEIGHT)
+        self.add(self.box)
+
+        self.connect('destroy', Gtk.main_quit)
+        self.listen_events()
+        self.listen_ctrl()
+        self.refresh()
+        self.show_all()
+        GLib.timeout_add(600, self._capture_active_thumb)  # first snapshot
+
+    # ---------- pinned persistence ----------
+    def load_pinned(self):
+        try:
+            with open(PINNED_FILE) as f:
+                return json.load(f)
+        except Exception:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            pins = [p for p in DEFAULT_PINNED if desktop_info(p)]
+            with open(PINNED_FILE, 'w') as f:
+                json.dump(pins, f, indent=2)
+            return pins
+
+    def load_minimized(self):
+        try:
+            with open(MINIMIZED_FILE) as f:
+                raw = json.load(f)
+            return {norm_addr(k): v for k, v in raw.items() if norm_addr(k)}
+        except Exception:
+            return {}
+
+    def save_minimized(self):
+        try:
+            os.makedirs(os.path.dirname(MINIMIZED_FILE), exist_ok=True)
+            with open(MINIMIZED_FILE, 'w') as f:
+                json.dump(self.minimized, f, indent=2)
+        except Exception:
+            pass
+
+    def save_pinned(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(PINNED_FILE, 'w') as f:
+            json.dump(self.pinned, f, indent=2)
+
+    def load_tray(self):
+        try:
+            with open(TRAY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(TRAY_FILE, 'w') as f:
+                json.dump(DEFAULT_TRAY, f, indent=2)
+            return list(DEFAULT_TRAY)
+
+    def save_tray(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(TRAY_FILE, 'w') as f:
+            json.dump(self.tray_apps, f, indent=2)
+
+    # ---------- hyprland events ----------
+    def listen_events(self):
+        sig = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')
+        run = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
+        path = f'{run}/hypr/{sig}/.socket2.sock'
+        self.evsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.evsock.connect(path)
+        self.evsock.setblocking(False)
+        self.evbuf = b''
+        GLib.io_add_watch(self.evsock.fileno(),
+                          GLib.IO_IN | GLib.IO_HUP, self.on_event)
+
+    def on_event(self, fd, cond):
+        if cond & GLib.IO_HUP:
+            Gtk.main_quit()
+            return False
+        try:
+            self.evbuf += self.evsock.recv(8192)
+        except BlockingIOError:
+            return True
+        while b'\n' in self.evbuf:
+            line, self.evbuf = self.evbuf.split(b'\n', 1)
+            ev = line.decode(errors='ignore')
+            kind = ev.split('>>')[0]
+            if kind == 'activewindowv2':
+                addr = ev.split('>>', 1)[1].strip()
+                self.active_addr = ('0x' + addr) if addr and addr != ',' else None
+                self.schedule_thumb()
+                self.schedule_refresh()
+            elif kind == 'closewindow':
+                addr = '0x' + ev.split('>>', 1)[1].strip()
+                self.thumb_cache.pop(addr, None)
+                self.minimized.pop(addr, None)
+                self.save_minimized()
+                try:
+                    os.unlink(thumb_path(addr))
+                except OSError:
+                    pass
+                self.schedule_refresh()
+            elif kind == 'minimized':
+                # titlebar minimize (via hypr-minimize plugin) or foreign-toplevel
+                # payload: "addr,1" or "addr,0"
+                # Games (Geometry Dash etc.) request minimize on focus-out —
+                # only honor when the window is still focused (real titlebar
+                # click). Super+M uses the control socket, not this path.
+                payload = ev.split('>>', 1)[1].strip()
+                parts = payload.split(',')
+                if len(parts) >= 2:
+                    addr = norm_addr(parts[0])
+                    if parts[1].strip() in ('1', 'true'):
+                        active = norm_addr(self.active_addr)
+                        if not active:
+                            aw = hyprctl('activewindow', want_json=True) or {}
+                            active = norm_addr(aw.get('address'))
+                        if active and addr != active:
+                            continue
+                        self.minimize_window(addr)
+                    else:
+                        self.restore_window(addr)
+            elif kind in ('openwindow', 'movewindow', 'movewindowv2',
+                          'fullscreen',
+                          'windowtitle', 'windowtitlev2',
+                          'workspace', 'workspacev2',
+                          'focusedmon', 'activespecial'):
+                self.schedule_refresh()
+        return True
+
+    # ---------- control socket (commands from ~/.local/bin/winbar-alttab) ----
+    def listen_ctrl(self):
+        try:
+            os.unlink(CTRL_SOCK)
+        except OSError:
+            pass
+        self.ctrl_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.ctrl_sock.bind(CTRL_SOCK)
+        self.ctrl_sock.setblocking(False)
+        GLib.io_add_watch(self.ctrl_sock.fileno(), GLib.IO_IN, self.on_ctrl)
+
+    def on_ctrl(self, fd, cond):
+        try:
+            cmd = self.ctrl_sock.recv(64).decode(errors='ignore').strip()
+        except BlockingIOError:
+            return True
+        if cmd == 'next':
+            self.alttab_step(1)
+        elif cmd == 'prev':
+            self.alttab_step(-1)
+        elif cmd == 'commit':
+            self.alttab_commit()
+        elif cmd == 'cancel':
+            self.alttab_cancel()
+        elif cmd == 'tray':
+            self.tray_toggle()
+        elif cmd == 'quick':
+            self.quick_toggle()
+        elif cmd == 'taskview':
+            self.taskview_toggle()
+        elif cmd == 'start':
+            self.start_toggle()
+        elif cmd == 'minimize':
+            # Super+M: toggle / reverse mid-animation if spammed
+            addr = self.active_addr
+            if not addr:
+                aw = hyprctl('activewindow', want_json=True) or {}
+                addr = aw.get('address')
+            self.toggle_minimize(addr)
+        return True
+
+    # ---------- ALT+TAB switcher (overlay layer, above fullscreen) ----------
+    def ensure_alttab(self):
+        if self.att_win:
+            return
+        LS = GtkLayerShell
+        w = Gtk.Window(title='winbar-alttab')
+        LS.init_for_window(w)
+        LS.set_layer(w, LS.Layer.OVERLAY)
+        LS.set_namespace(w, 'winbar-alttab')
+        # no anchors -> compositor centers it on the monitor
+
+        visual = w.get_screen().get_rgba_visual()
+        if visual:
+            w.set_visual(visual)
+        w.set_app_paintable(True)
+
+        outer = Gtk.Box()
+        outer.get_style_context().add_class('previewcard')
+        self.att_box = Gtk.FlowBox()
+        self.att_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.att_box.set_homogeneous(True)
+        self.att_box.set_column_spacing(8)
+        self.att_box.set_row_spacing(8)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(self.att_box, f'set_margin_{m}')(12)
+        outer.add(self.att_box)
+        w.add(outer)
+        self.att_win = w
+
+    def alttab_step(self, step):
+        # session already open: just move the selection
+        if self.att_win and self.att_win.get_visible():
+            if self.att_list:
+                self.att_sel = (self.att_sel + step) % len(self.att_list)
+                self.alttab_update_sel()
+            return
+
+        # start a new session: only windows on the workspaces currently
+        # visible on the monitors, most-recently-used first
+        visible_ws = set()
+        for m in hyprctl('monitors', want_json=True) or []:
+            visible_ws.add(m.get('activeWorkspace', {}).get('id'))
+            sp = m.get('specialWorkspace', {}).get('id', 0)
+            if sp:   # a scratchpad is showing on this monitor
+                visible_ws.add(sp)
+        visible_ws.discard(None)
+        clients = [c for c in (hyprctl('clients', want_json=True) or [])
+                   if c.get('mapped', True) and c.get('class')
+                   and c.get('workspace', {}).get('id') in visible_ws]
+        clients.sort(key=lambda c: c.get('focusHistoryID', 9999))
+        if not clients:
+            return
+        self.ensure_alttab()
+        n = len(clients)
+        self.att_list = clients
+        self.att_sel = (1 if step > 0 else n - 1) % n
+        self.att_cards = []
+
+        for ch in self.att_box.get_children():
+            self.att_box.remove(ch)
+        per_line = max(1, min(n, (self.mon_w - 120) // (THUMB_W + 44)))
+        self.att_box.set_max_children_per_line(per_line)
+        self.att_box.set_min_children_per_line(min(n, per_line))
+        for i, c in enumerate(clients):
+            card = self.win_card(c, lambda _b, i=i: self.alttab_pick(i))
+            self.att_cards.append(card)
+            self.att_box.add(card)
+
+        # show on the currently focused monitor
+        for m in hyprctl('monitors', want_json=True) or []:
+            if m.get('focused'):
+                gm = Gdk.Display.get_default().get_monitor_at_point(
+                    m.get('x', 0) + m.get('width', 0) // 2,
+                    m.get('y', 0) + m.get('height', 0) // 2)
+                if gm:
+                    GtkLayerShell.set_monitor(self.att_win, gm)
+                break
+        self.alttab_update_sel()
+        self.att_win.show_all()
+
+    def win_card(self, c, on_click):
+        """Preview card for one window (used by alt-tab and task view)."""
+        cls = c.get('class') or ''
+        g = {'info': self.resolver.resolve(cls), 'cls': cls}
+        card = Gtk.Button()
+        card.get_style_context().add_class('wincard')
+        card.set_relief(Gtk.ReliefStyle.NONE)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        header.pack_start(self.icon_image(g, 16), False, False, 0)
+        title = c.get('title') or cls
+        if len(title) > 26:
+            title = title[:24] + '…'
+        lbl = Gtk.Label(label=title)
+        lbl.get_style_context().add_class('cardtitle')
+        lbl.set_halign(Gtk.Align.START)
+        header.pack_start(lbl, True, True, 0)
+        vbox.pack_start(header, False, False, 0)
+
+        frame = Gtk.Box()
+        frame.get_style_context().add_class('thumbframe')
+        pix = self.thumb_pixbuf(c.get('address'))
+        if pix is not None:
+            img = Gtk.Image.new_from_pixbuf(pix)
+        else:
+            img = self.icon_image(g, 48)
+            img.set_size_request(THUMB_W, THUMB_H)
+        img.set_halign(Gtk.Align.CENTER)
+        img.set_valign(Gtk.Align.CENTER)
+        frame.set_size_request(THUMB_W, THUMB_H)
+        frame.pack_start(img, True, True, 0)
+        vbox.pack_start(frame, False, False, 0)
+
+        card.add(vbox)
+        card.connect('clicked', on_click)
+        return card
+
+    def alttab_pick(self, idx):
+        self.att_sel = idx
+        self.alttab_commit()
+
+    def alttab_update_sel(self):
+        for i, card in enumerate(self.att_cards):
+            sc = card.get_style_context()
+            if i == self.att_sel:
+                sc.add_class('altsel')
+            else:
+                sc.remove_class('altsel')
+
+    def alttab_commit(self):
+        if not (self.att_win and self.att_win.get_visible()):
+            return
+        addr = None
+        if 0 <= self.att_sel < len(self.att_list):
+            addr = self.att_list[self.att_sel].get('address')
+        self.alttab_cancel()
+        if addr:
+            dispatch('focuswindow', f'address:{addr}')
+            dispatch('alterzorder', f'top,address:{addr}')
+
+    def alttab_cancel(self):
+        if self.att_win and self.att_win.get_visible():
+            self.att_win.hide()
+        self.att_list = []
+        self.att_cards = []
+        self.att_sel = 0
+
+    # ---------- shared: fullscreen click-away backdrop ----------
+    def _cursor_gdk_mon(self):
+        try:
+            x, y = [int(v.strip()) for v in hyprctl('cursorpos').split(',')]
+            return Gdk.Display.get_default().get_monitor_at_point(x, y)
+        except Exception:
+            return None
+
+    def _focused_gdk_mon(self):
+        for m in hyprctl('monitors', want_json=True) or []:
+            if m.get('focused'):
+                return Gdk.Display.get_default().get_monitor_at_point(
+                    m.get('x', 0) + m.get('width', 0) // 2,
+                    m.get('y', 0) + m.get('height', 0) // 2)
+        return None
+
+    def _backdrop(self, name, on_close, dim=False, layer=None):
+        """Fullscreen overlay window: clicking empty space or pressing
+        Esc closes it. Content decides its own alignment."""
+        LS = GtkLayerShell
+        w = Gtk.Window(title=name)
+        LS.init_for_window(w)
+        LS.set_layer(w, LS.Layer.OVERLAY if layer is None else layer)
+        for e in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT):
+            LS.set_anchor(w, e, True)
+        LS.set_exclusive_zone(w, -1)   # cover the whole screen, bar included
+        LS.set_namespace(w, name)
+        if hasattr(LS, 'set_keyboard_mode'):
+            LS.set_keyboard_mode(w, LS.KeyboardMode.ON_DEMAND)
+        visual = w.get_screen().get_rgba_visual()
+        if visual:
+            w.set_visual(visual)
+        w.set_app_paintable(True)
+        if dim:
+            w.get_style_context().add_class('tvbackdrop')
+        w.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                     | Gdk.EventMask.KEY_PRESS_MASK)
+        w.connect('button-press-event', lambda _w, _e: (on_close(), True)[1])
+        w.connect('key-press-event',
+                  lambda _w, e: ((on_close(), True)[1]
+                                 if e.keyval == Gdk.KEY_Escape else False))
+        return w
+
+    @staticmethod
+    def _swallow_clicks(widget):
+        """Wrap in an input-only EventBox so clicks on the panel don't
+        bubble to the backdrop and close it. The box must adopt the
+        panel's alignment: as the window's direct child it would
+        otherwise fill the whole screen and swallow every click,
+        so the backdrop never sees a click-off."""
+        eb = Gtk.EventBox()
+        eb.set_visible_window(False)
+        eb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        eb.connect('button-press-event', lambda *_: True)
+        eb.set_halign(widget.get_halign())
+        eb.set_valign(widget.get_valign())
+        eb.add(widget)
+        return eb
+
+    # ---------- tray overflow (hide-to-tray apps) ----------
+    def tray_tag(self, app_id):
+        if app_id and app_id not in self.tray_apps:
+            self.tray_apps.append(app_id)
+            self.save_tray()
+            self.refresh()
+
+    def tray_untag(self, app_id):
+        if app_id in self.tray_apps:
+            self.tray_apps.remove(app_id)
+            self.save_tray()
+            self.tray_close()
+            self.refresh()
+
+    def tray_close(self):
+        if self.tray_pop:
+            self.tray_pop.destroy()
+            self.tray_pop = None
+
+    def tray_toggle(self):
+        if self.tray_pop:
+            self.tray_close()
+            return
+        self.groups = self.build_groups()   # freshen tray_groups
+        w = self._backdrop('winbar-tray', self.tray_close)
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        panel.get_style_context().add_class('previewcard')
+        panel.set_halign(Gtk.Align.END)
+        panel.set_valign(Gtk.Align.END)
+        panel.set_margin_end(150)
+        panel.set_margin_bottom(BAR_HEIGHT + 8)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(inner, f'set_margin_{m}')(8)
+
+        if self.tray_groups:
+            fb = Gtk.FlowBox()
+            fb.set_selection_mode(Gtk.SelectionMode.NONE)
+            fb.set_max_children_per_line(4)
+            fb.set_min_children_per_line(min(4, len(self.tray_groups)))
+            for k, g in self.tray_groups.items():
+                b = Gtk.Button()
+                b.get_style_context().add_class('traybtn')
+                b.set_relief(Gtk.ReliefStyle.NONE)
+                b.add(self.icon_image(g, 24))
+                name = (g['info'].get_display_name() if g['info']
+                        else (g['cls'] or '?'))
+                n = len(g['windows'])
+                b.set_tooltip_text(
+                    f"{name} — {n} window{'s' if n > 1 else ''}")
+                b._group = g
+                b._key = k
+                b.connect('button-press-event', self.on_tray_press)
+                fb.add(b)
+            inner.pack_start(fb, False, False, 0)
+        else:
+            lbl = Gtk.Label(label='No tray apps running')
+            lbl.get_style_context().add_class('traylabel')
+            for m in ('top', 'bottom', 'start', 'end'):
+                getattr(lbl, f'set_margin_{m}')(8)
+            inner.pack_start(lbl, False, False, 0)
+
+        panel.add(inner)
+        w.add(self._swallow_clicks(panel))
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.tray_pop = w
+        w.show_all()
+
+    def on_tray_press(self, btn, event):
+        g = btn._group
+        if event.button == 1:
+            self.tray_close()
+            if g['windows']:
+                self.focus(g['windows'][0]['address'])
+            return True
+        if event.button == 3:
+            menu = Gtk.Menu()
+            mi = Gtk.MenuItem(label='Show in taskbar')
+            mi.connect('activate', lambda _m, k=btn._key: self.tray_untag(k))
+            menu.append(mi)
+            if g['info']:
+                mi = Gtk.MenuItem(label='Open new window')
+                mi.connect('activate', lambda _m: self.launch(g))
+                menu.append(mi)
+            if g['windows']:
+                mi = Gtk.MenuItem(
+                    label=('Close window' if len(g['windows']) == 1
+                           else f"Close all {len(g['windows'])} windows"))
+                mi.connect('activate', lambda _m: self.close_all(g))
+                menu.append(mi)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        return False
+
+    # ---------- start menu (rofi) with click-off backdrop ----------
+    def start_close(self):
+        if self.start_timer:
+            GLib.source_remove(self.start_timer)
+            self.start_timer = None
+        subprocess.run(['pkill', '-x', 'rofi'], capture_output=True)
+        if self.start_win:
+            self.start_win.destroy()
+            self.start_win = None
+
+    def start_toggle(self):
+        if self.start_win or subprocess.run(
+                ['pgrep', '-x', 'rofi'],
+                capture_output=True).returncode == 0:
+            self.start_close()
+            return
+        # Backdrop on the TOP layer, rofi (overlay layer) maps above it:
+        # clicks beside the menu land on the backdrop and close both.
+        w = self._backdrop('winbar-start', self.start_close,
+                           layer=GtkLayerShell.Layer.TOP)
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.start_win = w
+        w.show_all()
+        subprocess.Popen(ROFI_CMD)
+        self.start_timer = GLib.timeout_add(300, self._start_watch)
+
+    def _start_watch(self):
+        # rofi went away on its own (app launched / Esc): drop backdrop
+        if subprocess.run(['pgrep', '-x', 'rofi'],
+                          capture_output=True).returncode != 0:
+            self.start_timer = None
+            self.start_close()
+            return False
+        return True
+
+    # ---------- quick settings (volume / mic / media / night light) -----
+    def quick_close(self):
+        if self.qs_timer:
+            GLib.source_remove(self.qs_timer)
+            self.qs_timer = None
+        if self.qs_win:
+            self.qs_win.destroy()
+            self.qs_win = None
+        self.qs_widgets = {}
+
+    def quick_toggle(self):
+        if self.qs_win:
+            self.quick_close()
+            return
+        w = self._backdrop('winbar-quick', self.quick_close)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class('previewcard')
+        card.set_halign(Gtk.Align.END)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_end(10)
+        card.set_margin_bottom(BAR_HEIGHT + 8)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        v.set_size_request(340, -1)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(v, f'set_margin_{m}')(14)
+
+        media = self.qs_media_section()
+        if media:
+            v.pack_start(media, False, False, 0)
+            v.pack_start(
+                Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
+                False, False, 0)
+        v.pack_start(self.qs_volume_row(), False, False, 0)
+        v.pack_start(self.qs_toggle_row(), False, False, 0)
+
+        card.add(v)
+        w.add(self._swallow_clicks(card))
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.qs_win = w
+        w.show_all()
+        self.qs_update()
+        self.qs_timer = GLib.timeout_add(1200, self.qs_update)
+
+    def _qsbtn(self, glyph, cb):
+        b = Gtk.Button(label=glyph)
+        b.get_style_context().add_class('qsbtn')
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.connect('clicked', cb)
+        return b
+
+    def _player(self):
+        try:
+            players = subprocess.run(
+                ['playerctl', '-l'], capture_output=True,
+                text=True, timeout=2).stdout.split()
+        except Exception:
+            return None
+        for p in players:
+            try:
+                st = subprocess.run(['playerctl', '-p', p, 'status'],
+                                    capture_output=True, text=True,
+                                    timeout=2).stdout.strip()
+            except Exception:
+                continue
+            if st == 'Playing':
+                return p
+        return players[0] if players else None
+
+    def qs_media_section(self):
+        player = self._player()
+        if not player:
+            return None
+        self.qs_widgets['player'] = player
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        art = Gtk.Image()
+        art.set_size_request(56, 56)
+        art.get_style_context().add_class('qsart')
+        box.pack_start(art, False, False, 0)
+
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        mid.set_valign(Gtk.Align.CENTER)
+        title = Gtk.Label(label='—')
+        title.get_style_context().add_class('qstitle')
+        title.set_halign(Gtk.Align.START)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.set_max_width_chars(18)
+        artist = Gtk.Label(label='')
+        artist.get_style_context().add_class('qsdim')
+        artist.set_halign(Gtk.Align.START)
+        artist.set_ellipsize(Pango.EllipsizeMode.END)
+        artist.set_max_width_chars(20)
+        mid.pack_start(title, False, False, 0)
+        mid.pack_start(artist, False, False, 0)
+        box.pack_start(mid, True, True, 0)
+
+        ctr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        ctr.set_valign(Gtk.Align.CENTER)
+        for glyph, act in (('󰒮', 'previous'),
+                           ('󰐊', 'play-pause'),
+                           ('󰒭', 'next')):
+            b = self._qsbtn(glyph, lambda _b, a=act: self._media_cmd(a))
+            if act == 'play-pause':
+                self.qs_widgets['play'] = b
+            ctr.pack_start(b, False, False, 0)
+        box.pack_start(ctr, False, False, 0)
+
+        self.qs_widgets.update(art=art, title=title, artist=artist)
+        return box
+
+    def _media_cmd(self, action):
+        p = self.qs_widgets.get('player')
+        if p:
+            subprocess.Popen(['playerctl', '-p', p, action])
+            GLib.timeout_add(250, self.qs_update)
+
+    def qs_volume_row(self):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        mute = self._qsbtn('󰕾', lambda _b: self._toggle_mute(
+            '@DEFAULT_AUDIO_SINK@'))
+        scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        scale.set_draw_value(False)
+        scale.set_hexpand(True)
+        scale.connect('value-changed', self.on_vol_changed)
+        pct = Gtk.Label(label='—')
+        pct.get_style_context().add_class('qstitle')
+        pct.set_width_chars(4)
+        row.pack_start(mute, False, False, 0)
+        row.pack_start(scale, True, True, 0)
+        row.pack_start(pct, False, False, 0)
+        self.qs_widgets.update(mute=mute, scale=scale, pct=pct)
+        return row
+
+    def on_vol_changed(self, scale):
+        if self.qs_setting:
+            return
+        v = int(scale.get_value())
+        subprocess.Popen(['wpctl', 'set-volume',
+                          '@DEFAULT_AUDIO_SINK@', f'{v}%'])
+        self.qs_widgets['pct'].set_label(f'{v}%')
+
+    def _toggle_mute(self, target):
+        subprocess.run(['wpctl', 'set-mute', target, 'toggle'],
+                       capture_output=True)
+        self.qs_update()
+
+    def qs_toggle_row(self):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        mic = self._qsbtn('󰍬', lambda _b: self._toggle_mute(
+            '@DEFAULT_AUDIO_SOURCE@'))
+        row.pack_start(mic, False, False, 0)
+        lbl = Gtk.Label(label='Mic')
+        lbl.get_style_context().add_class('qsdim')
+        row.pack_start(lbl, False, False, 0)
+        self.qs_widgets['mic'] = mic
+
+        if shutil.which('hyprsunset'):
+            night = self._qsbtn('󰖔', lambda _b: self._cycle_night())
+            night.set_tooltip_text('Click: next intensity · '
+                                   'right-click: off')
+            night.connect('button-press-event', self._night_press)
+            row.pack_end(Gtk.Label(label=''), False, False, 0)
+            nlbl = Gtk.Label(label='Night light')
+            nlbl.get_style_context().add_class('qsdim')
+            row.pack_end(nlbl, False, False, 0)
+            row.pack_end(night, False, False, 4)
+            self.qs_widgets['night'] = night
+            self.qs_widgets['nightlbl'] = nlbl
+        return row
+
+    # ---------- night light: Off → warm steps → pure red ----------
+    def _night_load(self):
+        try:
+            with open(NIGHT_STATE) as f:
+                return max(0, min(int(f.read().strip()),
+                                  len(NIGHT_STEPS) - 1))
+        except Exception:
+            return 0
+
+    def _night_save(self):
+        try:
+            with open(NIGHT_STATE, 'w') as f:
+                f.write(str(self.night_step))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _night_running():
+        return subprocess.run(['pgrep', '-x', 'hyprsunset'],
+                              capture_output=True).returncode == 0
+
+    @staticmethod
+    def _night_shader_on():
+        try:
+            out = subprocess.run(
+                ['hyprctl', 'getoption', 'decoration:screen_shader', '-j'],
+                capture_output=True, text=True, timeout=2).stdout
+            return os.path.basename(NIGHT_SHADER) in out
+        except Exception:
+            return False
+
+    def _night_reconcile(self):
+        """Drop back to reality if hyprsunset/the shader were toggled
+        behind our back (killed manually, hyprctl reload, …)."""
+        _, val = NIGHT_STEPS[self.night_step]
+        if val == 'red':
+            if not self._night_shader_on():
+                self.night_step = 0
+        elif val is not None:
+            if not self._night_running():
+                self.night_step = 0
+        else:
+            if self._night_shader_on():
+                self.night_step = len(NIGHT_STEPS) - 1
+            elif self._night_running():
+                self.night_step = 1
+
+    def _night_apply(self):
+        _, val = NIGHT_STEPS[self.night_step]
+        if val == 'red':
+            subprocess.run(['pkill', '-x', 'hyprsunset'],
+                           capture_output=True)
+            if not os.path.exists(NIGHT_SHADER):
+                with open(NIGHT_SHADER, 'w') as f:
+                    f.write(NIGHT_SHADER_SRC)
+            subprocess.run(['hyprctl', 'keyword',
+                            'decoration:screen_shader', NIGHT_SHADER],
+                           capture_output=True)
+            return
+        subprocess.run(['hyprctl', 'keyword',
+                        'decoration:screen_shader', '[[EMPTY]]'],
+                       capture_output=True)
+        if val is None:
+            subprocess.run(['pkill', '-x', 'hyprsunset'],
+                           capture_output=True)
+        elif self._night_running():
+            # live instance: retune over IPC, no restart flicker
+            subprocess.run(['hyprctl', 'hyprsunset',
+                            'temperature', str(val)],
+                           capture_output=True)
+        else:
+            subprocess.Popen(['setsid', '-f', 'hyprsunset',
+                              '-t', str(val)])
+
+    def _cycle_night(self):
+        self._night_reconcile()
+        self.night_step = (self.night_step + 1) % len(NIGHT_STEPS)
+        self._night_save()
+        self._night_apply()
+        GLib.timeout_add(300, self.qs_update)
+
+    def _night_press(self, _btn, event):
+        if event.button == 3:   # right-click: straight to Off
+            self.night_step = 0
+            self._night_save()
+            self._night_apply()
+            GLib.timeout_add(300, self.qs_update)
+            return True
+        return False
+
+    @staticmethod
+    def _wpctl_vol(target):
+        try:
+            out = subprocess.run(['wpctl', 'get-volume', target],
+                                 capture_output=True, text=True,
+                                 timeout=2).stdout
+            vol = int(float(out.split()[1]) * 100)
+            return vol, '[MUTED]' in out
+        except Exception:
+            return None, False
+
+    def qs_update(self):
+        if not self.qs_win:
+            self.qs_timer = None
+            return False
+        qw = self.qs_widgets
+        vol, muted = self._wpctl_vol('@DEFAULT_AUDIO_SINK@')
+        if vol is not None:
+            self.qs_setting = True
+            qw['scale'].set_value(vol)
+            self.qs_setting = False
+            qw['pct'].set_label(f'{vol}%')
+            qw['mute'].set_label('󰝟' if muted else '󰕾')
+        _, mic_muted = self._wpctl_vol('@DEFAULT_AUDIO_SOURCE@')
+        qw['mic'].set_label('󰍭' if mic_muted else '󰍬')
+
+        if 'night' in qw:
+            self._night_reconcile()
+            name, val = NIGHT_STEPS[self.night_step]
+            ctx = qw['night'].get_style_context()
+            ctx.add_class('on') if val else ctx.remove_class('on')
+            qw['nightlbl'].set_label(
+                f'Night light · {name}' if val else 'Night light')
+
+        if 'title' in qw and qw.get('player'):
+            try:
+                out = subprocess.run(
+                    ['playerctl', '-p', qw['player'], 'metadata', '--format',
+                     '{{title}}\x1f{{artist}}\x1f{{mpris:artUrl}}\x1f{{status}}'],
+                    capture_output=True, text=True, timeout=2).stdout.strip()
+                title, artist, art_url, status = (out.split('\x1f') + [''] * 4)[:4]
+                if title:
+                    qw['title'].set_label(title)
+                qw['artist'].set_label(artist)
+                qw['play'].set_label('󰏤' if status == 'Playing' else '󰐊')
+                self.qs_set_art(art_url)
+            except Exception:
+                pass
+        return True
+
+    def qs_set_art(self, url):
+        if not url or self.qs_widgets.get('art_url') == url:
+            return
+        self.qs_widgets['art_url'] = url
+        if url.startswith('file://'):
+            try:
+                self._apply_art(GLib.filename_from_uri(url)[0])
+            except Exception:
+                pass
+        elif url.startswith('http'):
+            os.makedirs(ART_DIR, exist_ok=True)
+            dest = os.path.join(
+                ART_DIR, hashlib.sha1(url.encode()).hexdigest())
+            if os.path.exists(dest):
+                self._apply_art(dest)
+            else:
+                def dl():
+                    try:
+                        urllib.request.urlretrieve(url, dest)
+                        GLib.idle_add(self._apply_art, dest)
+                    except Exception:
+                        pass
+                threading.Thread(target=dl, daemon=True).start()
+
+    def _apply_art(self, path):
+        if self.qs_win and 'art' in self.qs_widgets:
+            try:
+                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    path, 56, 56, True)
+                self.qs_widgets['art'].set_from_pixbuf(pix)
+            except Exception:
+                pass
+        return False
+
+    # ---------- task view (WIN+TAB): all workspaces + windows ----------
+    def taskview_close(self):
+        if self.tv_win:
+            self.tv_win.destroy()
+            self.tv_win = None
+
+    def taskview_toggle(self):
+        if self.tv_win:
+            self.taskview_close()
+            return
+        clients = [c for c in (hyprctl('clients', want_json=True) or [])
+                   if c.get('mapped', True) and c.get('class')]
+        by_ws = {}
+        for c in clients:
+            by_ws.setdefault(c.get('workspace', {}).get('id', 0),
+                             []).append(c)
+        if not by_ws:
+            return
+        ws_info = {w['id']: w
+                   for w in hyprctl('workspaces', want_json=True) or []}
+
+        w = self._backdrop('winbar-taskview', self.taskview_close)
+        # dim layer: a real Box paints its CSS background reliably
+        # (the app-paintable window itself doesn't)
+        dimbox = Gtk.Box()
+        dimbox.get_style_context().add_class('tvbackdrop')
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        v.set_halign(Gtk.Align.CENTER)
+        v.set_valign(Gtk.Align.CENTER)
+
+        for ws_id in sorted(by_ws, key=lambda i: (i < 0, abs(i))):
+            wins = sorted(by_ws[ws_id],
+                          key=lambda c: c.get('focusHistoryID', 9999))
+            mon = ws_info.get(ws_id, {}).get('monitor', '')
+            name = ('Scratchpad' if ws_id < 0 else f'Workspace {ws_id}')
+            if mon:
+                name += f'   ·   {mon}'
+            hd = Gtk.Label(label=name)
+            hd.get_style_context().add_class('tvheader')
+            hd.set_halign(Gtk.Align.START)
+            v.pack_start(hd, False, False, 0)
+
+            fb = Gtk.FlowBox()
+            fb.set_selection_mode(Gtk.SelectionMode.NONE)
+            fb.set_homogeneous(True)
+            fb.set_column_spacing(8)
+            fb.set_row_spacing(8)
+            per_line = max(1, min(len(wins),
+                                  (self.mon_w - 300) // (THUMB_W + 44)))
+            fb.set_max_children_per_line(per_line)
+            fb.set_min_children_per_line(per_line)
+            fb.set_halign(Gtk.Align.START)
+            for c in wins:
+                addr = c.get('address')
+                fb.add(self.win_card(
+                    c, lambda _b, a=addr: self.taskview_pick(a)))
+            v.pack_start(fb, False, False, 0)
+
+        eb = self._swallow_clicks(v)
+        eb.set_hexpand(True)
+        eb.set_vexpand(True)
+        eb.set_halign(Gtk.Align.CENTER)
+        eb.set_valign(Gtk.Align.CENTER)
+        dimbox.pack_start(eb, True, True, 0)
+        w.add(dimbox)
+        gm = self._focused_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.tv_win = w
+        w.show_all()
+
+    def taskview_pick(self, addr):
+        self.taskview_close()
+        if addr:
+            dispatch('focuswindow', f'address:{addr}')
+            dispatch('alterzorder', f'top,address:{addr}')
+
+    def schedule_refresh(self):
+        if not self.refresh_pending:
+            self.refresh_pending = True
+            GLib.timeout_add(120, self._do_refresh)
+
+    def _do_refresh(self):
+        self.refresh_pending = False
+        self.refresh()
+        return False
+
+    # ---------- thumbnails ----------
+    def schedule_thumb(self):
+        if self.thumb_timer:
+            GLib.source_remove(self.thumb_timer)
+        self.thumb_timer = GLib.timeout_add(650, self._capture_active_thumb)
+
+    def _capture_active_thumb(self):
+        self.thumb_timer = None
+        addr = self.active_addr
+        c = self.clients_by_addr.get(addr)
+        if not c or self.capture_proc is not None:
+            return False
+        x, y = c.get('at', (0, 0))
+        w, h = c.get('size', (0, 0))
+        # clamp to the monitor the window is mostly on
+        for m in hyprctl('monitors', want_json=True) or []:
+            mx, my = m.get('x', 0), m.get('y', 0)
+            mw, mh = m.get('width', 0), m.get('height', 0)
+            if mx <= x + w // 2 < mx + mw and my <= y + h // 2 < my + mh:
+                nx, ny = max(x, mx), max(y, my)
+                w = min(x + w, mx + mw) - nx
+                h = min(y + h, my + mh) - ny
+                x, y = nx, ny
+                break
+        if w < 60 or h < 40:
+            return False
+        try:
+            # write to .tmp, rename when grim exits -> readers never
+            # see a half-written file (that caused visual artifacts)
+            self.capture_addr = addr
+            self.capture_proc = subprocess.Popen(
+                ['grim', '-g', f'{int(x)},{int(y)} {int(w)}x{int(h)}',
+                 '-s', '0.4', '-t', 'jpeg', '-q', '75',
+                 thumb_path(addr) + '.tmp'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            GLib.timeout_add(80, self._finish_capture)
+        except Exception:
+            self.capture_proc = None
+        return False
+
+    def _finish_capture(self):
+        p = self.capture_proc
+        if p is None:
+            return False
+        if p.poll() is None:
+            return True     # still running, poll again
+        self.capture_proc = None
+        addr = self.capture_addr
+        tmp = thumb_path(addr) + '.tmp'
+        if p.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, thumb_path(addr))
+            self.thumb_cache.pop(addr, None)
+        else:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+
+    def thumb_pixbuf(self, addr):
+        tp = thumb_path(addr or '')
+        try:
+            mtime = os.path.getmtime(tp)
+        except OSError:
+            return None
+        cached = self.thumb_cache.get(addr)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                tp, THUMB_W, THUMB_H, True)
+        except Exception:
+            return None
+        self.thumb_cache[addr] = (mtime, pix)
+        return pix
+
+    # ---------- model ----------
+    def build_groups(self):
+        clients = hyprctl('clients', want_json=True) or []
+        self.clients_by_addr = {
+            norm_addr(c.get('address')): c
+            for c in clients if c.get('address')}
+
+        # hide like the Windows taskbar while something is fullscreen
+        # on our monitor's *currently visible* workspace. A game left
+        # fullscreen on a background workspace must NOT hide the dock —
+        # only fullscreen on the workspace we're actually looking at.
+        active_ws = None
+        for m in hyprctl('monitors', want_json=True) or []:
+            if m.get('id') == self.mon_id:
+                active_ws = m.get('activeWorkspace', {}).get('id')
+                break
+        fs = any(c.get('fullscreen') and c.get('monitor') == self.mon_id
+                 and c.get('workspace', {}).get('id') == active_ws
+                 and c.get('mapped', True) for c in clients)
+        if fs and self.get_visible():
+            self.close_preview()
+            self.hide()
+        elif not fs and not self.get_visible():
+            self.show()
+
+        if self.active_addr is None:
+            aw = hyprctl('activewindow', want_json=True)
+            if isinstance(aw, dict):
+                self.active_addr = aw.get('address')
+
+        groups = {}
+        for pid in self.pinned:
+            groups[pid] = {'id': pid, 'info': desktop_info(pid), 'cls': None,
+                           'windows': [], 'pinned': True}
+
+        for c in clients:
+            cls = c.get('class') or ''
+            if not cls or not c.get('mapped', True):
+                continue
+            info = self.resolver.resolve(cls)
+            key = info.get_id() if info else cls.lower()
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {'id': key, 'info': info, 'cls': cls,
+                                   'windows': [], 'pinned': False}
+            g['cls'] = cls
+            g['pinned'] = g['pinned'] or key in self.pinned
+            addr = norm_addr(c.get('address'))
+            # Recover minimize bookkeeping if the window is already parked
+            if is_minimized_ws(c.get('workspace')) and addr not in self.minimized:
+                self.minimized[addr] = {
+                    'workspace': 1,
+                    'ws_name': '1',
+                    'class': cls,
+                }
+                self.save_minimized()
+            g['windows'].append({
+                'address': addr,
+                'title': c.get('title') or cls,
+                'minimized': self.is_addr_minimized(addr),
+            })
+
+        # apps tagged "hide to tray" live in the chevron popup, not the bar
+        self.tray_groups = {k: g for k, g in groups.items()
+                            if k in self.tray_apps and g['windows']}
+        for k in self.tray_apps:
+            groups.pop(k, None)
+        return groups
+
+    def refresh(self):
+        self.groups = self.build_groups()
+
+        self.order = [k for k in self.order if k in self.groups]
+        for k in self.groups:
+            if k not in self.order:
+                self.order.append(k)
+
+        for k in list(self.buttons):
+            if k not in self.groups:
+                if self.pop_key == k:
+                    self.close_preview()
+                self.box.remove(self.buttons.pop(k))
+
+        for idx, k in enumerate(self.order):
+            g = self.groups[k]
+            btn = self.buttons.get(k)
+            if btn is None:
+                btn = self.buttons[k] = self.create_button(k)
+                self.box.pack_start(btn, False, False, 0)
+            self.update_button(btn, g)
+            self.box.reorder_child(btn, idx)
+
+        self.box.show_all()
+        for btn in self.buttons.values():
+            btn._badge.set_visible(btn._n > 1)
+
+        # live-update an open preview (signature-guarded, no flicker)
+        if (self.pop_key and self.preview and self.preview.get_visible()
+                and self.pop_key in self.groups):
+            self.fill_preview(self.groups[self.pop_key])
+
+    # ---------- icons ----------
+    def gicon_for(self, g):
+        if g['info']:
+            icon = g['info'].get_icon()
+            if icon:
+                return icon
+        theme = Gtk.IconTheme.get_default()
+        for cand in (g['cls'] or '', (g['cls'] or '').lower()):
+            if cand and theme.has_icon(cand):
+                return Gio.ThemedIcon.new(cand)
+        return Gio.ThemedIcon.new('application-x-executable')
+
+    def icon_image(self, g, size):
+        img = Gtk.Image.new_from_gicon(self.gicon_for(g), Gtk.IconSize.INVALID)
+        img.set_pixel_size(size)
+        return img
+
+    # ---------- buttons ----------
+    def create_button(self, key):
+        btn = Gtk.Button()
+        btn.get_style_context().add_class('appbtn')
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_focus_on_click(False)
+        btn._key = key
+        btn._iconcls = '__unset__'
+        btn._n = 0
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        btn._iconslot = Gtk.Box()
+        vbox.pack_start(btn._iconslot, False, False, 0)
+        btn._ind = Gtk.Box()
+        btn._ind.get_style_context().add_class('ind')
+        btn._ind.set_halign(Gtk.Align.CENTER)
+        vbox.pack_start(btn._ind, False, False, 0)
+
+        over = Gtk.Overlay()
+        over.add(vbox)
+        btn._badge = Gtk.Label(label='')
+        btn._badge.get_style_context().add_class('badge')
+        btn._badge.set_halign(Gtk.Align.END)
+        btn._badge.set_valign(Gtk.Align.START)
+        btn._badge.set_no_show_all(True)
+        over.add_overlay(btn._badge)
+        over.set_overlay_pass_through(btn._badge, True)
+        btn.add(over)
+
+        btn.add_events(Gdk.EventMask.BUTTON1_MOTION_MASK
+                       | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        btn.connect('clicked', self.on_click)
+        btn.connect('button-press-event', self.on_press)
+        btn.connect('button-release-event', self.on_release)
+        btn.connect('motion-notify-event', self.on_motion)
+        btn.connect('enter-notify-event', self.on_btn_enter)
+        btn.connect('leave-notify-event', self.on_btn_leave)
+        return btn
+
+    def update_button(self, btn, g):
+        n = len(g['windows'])
+        btn._n = n
+        btn._group = g
+
+        if g['cls'] != btn._iconcls:
+            btn._iconcls = g['cls']
+            for ch in btn._iconslot.get_children():
+                btn._iconslot.remove(ch)
+            btn._iconslot.pack_start(self.icon_image(g, ICON_SIZE),
+                                     False, False, 0)
+
+        ctx = btn.get_style_context()
+        is_active = any(w['address'] == self.active_addr
+                        for w in g['windows'])
+        all_min = n > 0 and all(
+            self.is_addr_minimized(w['address']) for w in g['windows'])
+        if is_active:
+            ctx.add_class('active-app')
+        else:
+            ctx.remove_class('active-app')
+        if all_min:
+            ctx.add_class('minimized-app')
+        else:
+            ctx.remove_class('minimized-app')
+
+        ind_ctx = btn._ind.get_style_context()
+        ind_ctx.remove_class('running')
+        ind_ctx.remove_class('active')
+        ind_ctx.remove_class('minimized')
+        if n > 0:
+            if all_min:
+                ind_ctx.add_class('minimized')
+            else:
+                ind_ctx.add_class('active' if is_active else 'running')
+            btn._ind.set_size_request(
+                18 if is_active else (14 if n > 1 else 8), 3)
+        else:
+            btn._ind.set_size_request(8, 3)
+
+        btn._badge.set_label(str(n) if n > 1 else '')
+
+        name = (g['info'].get_display_name() if g['info']
+                else (g['cls'] or '?'))
+        btn.set_tooltip_text(g['windows'][0]['title'] if n == 1 else name)
+
+    # ---------- manual drag-to-reorder ----------
+    # (GTK/Wayland DnD doesn't work from layer-shell surfaces, so we
+    #  track the pointer ourselves and shuffle icons live.)
+    def on_press(self, btn, event):
+        if event.button == 3:
+            self.show_context_menu(btn, event)
+            return True
+        if event.button == 2:      # middle click = open a new window
+            self.launch(btn._group)
+            return True
+        if event.button == 1:
+            self.press_key = btn._key
+            self.press_x = event.x_root
+            self.drag_active = False
+        return False
+
+    def on_motion(self, btn, event):
+        if self.press_key != btn._key:
+            return False
+        if not self.drag_active:
+            if abs(event.x_root - self.press_x) < DRAG_THRESHOLD:
+                return False
+            self.drag_active = True
+            self.cancel_timers()
+            self.close_preview()
+            btn.set_opacity(0.55)
+        # pointer x in dock-box coordinates (x_root is toplevel-relative
+        # on wayland and our toplevel starts at box x=0)
+        px = event.x_root
+        cur = self.order.index(btn._key)
+        target = cur
+        for i, k in enumerate(self.order):
+            if k == btn._key:
+                continue
+            a = self.buttons[k].get_allocation()
+            center = a.x + a.width / 2
+            if i < cur and px < center:
+                target = min(target, i)
+            elif i > cur and px > center:
+                target = max(target, i)
+        if target != cur:
+            self.order.remove(btn._key)
+            self.order.insert(target, btn._key)
+            self.box.reorder_child(btn, target)
+        return True
+
+    def on_release(self, btn, event):
+        was_drag = self.drag_active
+        self.press_key = None
+        self.drag_active = False
+        if was_drag:
+            btn.set_opacity(1.0)
+            pinset = set(self.pinned)
+            self.pinned = [k for k in self.order if k in pinset]
+            self.save_pinned()
+            return True     # swallow the click that would follow
+        return False
+
+    # ---------- interactions ----------
+    def on_click(self, btn):
+        g = btn._group
+        n = len(g['windows'])
+        if n == 0:
+            self.launch(g)
+            return
+        if n == 1:
+            addr = g['windows'][0]['address']
+            # mid-anim click reverses; otherwise Windows-style min on focused
+            if addr in self._anim:
+                self._reverse_anim(addr)
+            elif (addr == self.active_addr
+                    and not self.is_addr_minimized(addr)):
+                self.minimize_window(addr)
+            else:
+                self.focus(addr)
+            return
+        # multi-window: restore any minimized first, else preview picker
+        minimized = [w for w in g['windows']
+                     if self.is_addr_minimized(w['address'])]
+        if minimized and all(self.is_addr_minimized(w['address'])
+                             for w in g['windows']):
+            for w in minimized:
+                self.restore_window(w['address'])
+            return
+        if (self.pop_key == btn._key and self.preview
+                and self.preview.get_visible()):
+            self.close_preview()
+        else:
+            self.show_preview_for(btn)
+
+    def launch(self, g):
+        if g['info']:
+            try:
+                # feed real launches into rofi recency
+                did = g.get('id') or (g['info'].get_id() if g['info'] else None)
+                if did:
+                    subprocess.Popen(
+                        [os.path.expanduser('~/.local/bin/app-recency'),
+                         'touch', did],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                g['info'].launch(None, None)
+            except Exception:
+                pass
+
+    def is_addr_minimized(self, addr):
+        addr = norm_addr(addr)
+        if not addr:
+            return False
+        # mid-flight minimize still shows the window — not "parked" yet
+        st = self._anim.get(addr)
+        if st and st.get('dir') == 'min':
+            return False
+        if st and st.get('dir') == 'rest':
+            return False  # coming back
+        if addr in self.minimized:
+            # only count as minimized once actually on the special ws
+            # (map is also used mid-anim as geometry stash)
+            c = self.clients_by_addr.get(addr) or self._client(addr)
+            if c and is_minimized_ws(c.get('workspace')):
+                return True
+            # map entry but still on a real workspace = anim stash only
+            if c and not is_minimized_ws(c.get('workspace')):
+                return False
+            return True
+        c = self.clients_by_addr.get(addr)
+        if c and is_minimized_ws(c.get('workspace')):
+            return True
+        return False
+
+    def _client(self, addr):
+        addr = norm_addr(addr)
+        c = self.clients_by_addr.get(addr)
+        if c:
+            return c
+        for cl in hyprctl('clients', want_json=True) or []:
+            if norm_addr(cl.get('address')) == addr:
+                return cl
+        return None
+
+    def _taskbar_icon_rect(self, addr, cls=None):
+        """Screen-space rect (x, y, w, h) of the taskbar icon for this window."""
+        addr = norm_addr(addr)
+        key = None
+        for k, g in (self.groups or {}).items():
+            if any(norm_addr(w.get('address')) == addr for w in g.get('windows', [])):
+                key = k
+                break
+            if cls and (g.get('cls') or '').lower() == cls.lower():
+                key = k
+        btn = self.buttons.get(key) if key else None
+        size = MIN_ANIM_SIZE
+        if btn is not None:
+            a = btn.get_allocation()
+            # layer-shell dock: left margin + icon offset, sitting on bottom
+            cx = self.mon_x + MARGIN_LEFT + a.x + a.width // 2
+            cy = self.mon_y + self.mon_h - BAR_HEIGHT // 2
+            return (int(cx - size // 2), int(cy - size // 2), size, size)
+        # fallback: center of the taskbar strip
+        cx = self.mon_x + self.mon_w // 2
+        cy = self.mon_y + self.mon_h - BAR_HEIGHT // 2
+        return (int(cx - size // 2), int(cy - size // 2), size, size)
+
+    def _set_geom(self, addr, x, y, w, h, animate=True):
+        """Move/resize a window; optionally skip Hyprland's animation."""
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        w = max(50, int(w))
+        h = max(50, int(h))
+        x, y = int(x), int(y)
+        try:
+            if not animate:
+                subprocess.run(
+                    ['hyprctl', '--batch',
+                     'keyword animations:enabled false;'
+                     f'dispatch resizewindowpixel exact {w} {h},'
+                     f'address:{addr};'
+                     f'dispatch movewindowpixel exact {x} {y},'
+                     f'address:{addr};'
+                     'keyword animations:enabled true'],
+                    capture_output=True, timeout=2)
+            else:
+                # resize then move so the window both shrinks and flies
+                subprocess.run(
+                    ['hyprctl', '--batch',
+                     f'dispatch resizewindowpixel exact {w} {h},'
+                     f'address:{addr};'
+                     f'dispatch movewindowpixel exact {x} {y},'
+                     f'address:{addr}'],
+                    capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    def _force_float_at(self, addr, x, y, w, h):
+        """Float a window and pin it to exact geometry with no intermediate jump.
+
+        Hyprland's setfloating on a tiled window often resizes/repositions it
+        (e.g. near-fullscreen). We immediately re-apply the saved rect so the
+        minimize shrink starts from where the window actually was.
+        """
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        w = max(50, int(w))
+        h = max(50, int(h))
+        x, y = int(x), int(y)
+        try:
+            subprocess.run(
+                ['hyprctl', '--batch',
+                 'keyword animations:enabled false;'
+                 f'dispatch setfloating address:{addr};'
+                 f'dispatch resizewindowpixel exact {w} {h},address:{addr};'
+                 f'dispatch movewindowpixel exact {x} {y},address:{addr};'
+                 'keyword animations:enabled true'],
+                capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    def _settle_tiled(self, addr):
+        """Drop back into the tiling layout without a second animated float move."""
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        try:
+            subprocess.run(
+                ['hyprctl', '--batch',
+                 'keyword animations:enabled false;'
+                 f'dispatch settiled address:{addr};'
+                 'keyword animations:enabled true'],
+                capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+    def _begin_no_warp(self):
+        """Freeze cursor warps for the duration of a minimize/restore anim.
+
+        Hyprland warps the pointer to a focused window's center on focus, so
+        without this the cursor rides the window into the taskbar and back.
+        We do NOT snapshot/restore cursor position — if you move the mouse
+        during the anim it should stay where you put it.
+        """
+        if self._warp_guard == 0:
+            try:
+                subprocess.run(
+                    ['hyprctl', 'keyword', 'cursor:no_warps', 'true'],
+                    capture_output=True, timeout=1)
+            except Exception:
+                pass
+        self._warp_guard += 1
+
+    def _end_no_warp(self):
+        self._warp_guard = max(0, self._warp_guard - 1)
+        if self._warp_guard != 0:
+            return
+        try:
+            subprocess.run(
+                ['hyprctl', 'keyword', 'cursor:no_warps', 'false'],
+                capture_output=True, timeout=1)
+        except Exception:
+            pass
+
+    def _focus_next_on_ws(self, prev_ws, exclude_addr):
+        if prev_ws is None:
+            return
+        exclude_addr = norm_addr(exclude_addr)
+        for cl in hyprctl('clients', want_json=True) or []:
+            a = norm_addr(cl.get('address'))
+            if (a != exclude_addr
+                    and (cl.get('workspace') or {}).get('id') == prev_ws
+                    and cl.get('mapped', True)
+                    and not is_minimized_ws(cl.get('workspace'))):
+                dispatch('focuswindow', f'address:{a}')
+                return
+
+    def _anim_add_timer(self, addr, ms, cb):
+        """Schedule a GLib timeout and track it so spam can cancel mid-flight."""
+        st = self._anim.get(addr)
+        if st is None:
+            return None
+
+        def _wrap():
+            # drop ourselves from the timer list then run
+            cur = self._anim.get(addr)
+            if cur and tid in cur.get('timers', []):
+                cur['timers'].remove(tid)
+            return cb()
+
+        tid = GLib.timeout_add(ms, _wrap)
+        st.setdefault('timers', []).append(tid)
+        return tid
+
+    def _anim_cancel(self, addr):
+        """Cancel pending timers for an in-flight min/restore. Keeps warp guard."""
+        st = self._anim.pop(addr, None)
+        if not st:
+            return None
+        for tid in st.get('timers', []):
+            try:
+                GLib.source_remove(tid)
+            except Exception:
+                pass
+        return st
+
+    def _anim_clear(self, addr):
+        """Finish an anim: drop state + release warp guard once."""
+        st = self._anim_cancel(addr)
+        self._end_no_warp()
+        if self._last_anim_addr == addr:
+            self._last_anim_addr = None
+        return st
+
+    def toggle_minimize(self, addr=None):
+        """Super+M entry: toggle, or reverse mid-animation if spammed."""
+        addr = norm_addr(addr)
+        # Prefer reversing whatever we just launched (focus may have moved).
+        if addr and addr in self._anim:
+            self._reverse_anim(addr)
+            return
+        if self._last_anim_addr and self._last_anim_addr in self._anim:
+            self._reverse_anim(self._last_anim_addr)
+            return
+        if not addr:
+            aw = hyprctl('activewindow', want_json=True) or {}
+            addr = norm_addr(aw.get('address'))
+        if not addr:
+            return
+        if self.is_addr_minimized(addr):
+            self.restore_window(addr)
+        else:
+            self.minimize_window(addr)
+
+    def _reverse_anim(self, addr):
+        """Cancel mid-flight anim and go the other way from current geometry."""
+        addr = norm_addr(addr)
+        st = self._anim_cancel(addr)
+        if not st:
+            return
+        meta = st.get('meta') or {}
+        direction = st.get('dir')
+        # Keep no_warps held across the reverse (begin was called for first leg;
+        # cancel doesn't end it — only _anim_clear does. We already popped
+        # timers but need warp_guard still up. Re-bookkeep: we cancelled out of
+        # _anim without _end_no_warp, so guard still +1. Good — reverse reuses it.
+        # Put addr back out of _anim so minimize/restore can start cleanly, but
+        # we already popped. warp_guard still elevated — reverse paths must
+        # either use _anim without double _begin_no_warp, or we end and re-begin.
+        # Simplest: end warp then let minimize/restore begin fresh.
+        self._end_no_warp()
+
+        if direction == 'min':
+            # Was shrinking → expand back to saved geom (don't park).
+            # meta is still in self.minimized; keep it for restore path then
+            # restore will pop — actually restore pops. Ensure meta present.
+            self.minimized[addr] = dict(meta)
+            self.save_minimized()
+            # Window is still on real workspace (park happens at end of min).
+            # Ensure floating at current size, then restore anim.
+            self.restore_window(addr, focus=bool(st.get('focus', True)),
+                                _from_reverse=True)
+        else:
+            # Was expanding → shrink & park again.
+            # restore had popped meta; put it back then minimize from here.
+            self.minimized[addr] = dict(meta)
+            self.save_minimized()
+            # Currently on real workspace floating mid-size. Minimize will
+            # re-save geom if we aren't careful — pass reverse so it uses meta.
+            self.minimize_window(addr, _from_reverse=True)
+
+    def minimize_window(self, addr, _from_reverse=False):
+        """Shrink toward the taskbar icon, then park on special:minimized."""
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        # Spam / reverse: if already animating this addr, flip direction
+        if addr in self._anim:
+            self._reverse_anim(addr)
+            return
+        if self.is_addr_minimized(addr) and not _from_reverse:
+            # already parked — treat as restore request
+            self.restore_window(addr)
+            return
+
+        c = self._client(addr)
+        if not c and not _from_reverse:
+            return
+
+        if _from_reverse:
+            meta = self.minimized.get(addr) or {}
+            at = meta.get('at') or [0, 0]
+            size = meta.get('size') or [800, 600]
+            floating = bool(meta.get('floating'))
+            fullscreen = int(meta.get('fullscreen') or 0)
+            prev_ws = meta.get('workspace')
+            cls = meta.get('class') or ''
+            # still floating mid-flight on real workspace — just reverse shrink
+        else:
+            ws = c.get('workspace') or {}
+            if is_minimized_ws(ws):
+                return
+            cls = (c.get('class') or '').lower()
+            if cls.startswith('winbar') or cls in ('rofi',):
+                return
+            at = c.get('at') or [0, 0]
+            size = c.get('size') or [800, 600]
+            floating = bool(c.get('floating'))
+            fullscreen = int(c.get('fullscreen') or 0)
+            prev_ws = ws.get('id')
+            meta = {
+                'workspace': prev_ws,
+                'ws_name': ws.get('name') or str(prev_ws or 1),
+                'class': c.get('class') or '',
+                'at': list(at),
+                'size': list(size),
+                'floating': floating,
+                'fullscreen': fullscreen,
+            }
+            self.minimized[addr] = meta
+            self.save_minimized()
+
+            if fullscreen:
+                dispatch('fullscreenstate', f'0 0,address:{addr}')
+            if not floating:
+                self._force_float_at(addr, at[0], at[1], size[0], size[1])
+
+        self.close_preview()
+        self._begin_no_warp()
+        self._last_anim_addr = addr
+        self._anim[addr] = {
+            'dir': 'min',
+            'timers': [],
+            'meta': dict(self.minimized.get(addr) or meta),
+            'focus': True,
+        }
+
+        if not _from_reverse:
+            self._focus_next_on_ws(prev_ws, addr)
+
+        tx, ty, tw, th = self._taskbar_icon_rect(
+            addr, (c or {}).get('class') if c else cls)
+        # from current geometry (mid-flight or full) shrink into the icon
+        self._set_geom(addr, tx, ty, tw, th, animate=True)
+
+        def _finish():
+            if addr not in self._anim or self._anim[addr].get('dir') != 'min':
+                return False
+            dispatch('movetoworkspacesilent',
+                     f'{MINIMIZED_WS},address:{addr}')
+            self._anim_clear(addr)
+            self._focus_next_on_ws(prev_ws, addr)
+            if self.active_addr == addr:
+                self.active_addr = None
+            self.schedule_refresh()
+            return False
+
+        self._anim_add_timer(addr, MIN_ANIM_MS, _finish)
+
+    def restore_window(self, addr, focus=True, _from_reverse=False):
+        """Un-minimize: expand out of the taskbar icon back to saved size."""
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        if addr in self._anim:
+            self._reverse_anim(addr)
+            return
+
+        if _from_reverse:
+            meta = dict(self.minimized.get(addr) or {})
+        else:
+            meta = self.minimized.pop(addr, None) or {}
+            self.save_minimized()
+            # keep a copy for reverse mid-flight
+        if not meta and not _from_reverse:
+            # nothing saved — just try to pull off special:minimized
+            meta = {
+                'workspace': 1, 'ws_name': '1', 'class': '',
+                'at': [self.mon_x + 80, self.mon_y + 80],
+                'size': [960, 640], 'floating': True, 'fullscreen': 0,
+            }
+
+        dest = meta.get('workspace')
+        if dest is None:
+            dest = meta.get('ws_name') or '1'
+        if isinstance(dest, str) and dest.startswith('special:'):
+            dest = 1
+        target = str(dest)
+
+        at = meta.get('at') or [self.mon_x + 80, self.mon_y + 80]
+        size = meta.get('size') or [960, 640]
+        was_floating = bool(meta.get('floating'))
+        was_fs = int(meta.get('fullscreen') or 0)
+
+        # hold meta for reverse; not parked once restore starts
+        if addr in self.minimized and not _from_reverse:
+            pass
+        elif _from_reverse:
+            # canceling a minimize: ensure not considered parked
+            self.minimized.pop(addr, None)
+            self.save_minimized()
+
+        self.close_preview()
+        self._begin_no_warp()
+        self._last_anim_addr = addr
+        self._anim[addr] = {
+            'dir': 'rest',
+            'timers': [],
+            'meta': dict(meta),
+            'focus': focus,
+        }
+
+        # From reverse-of-minimize we're already on the real workspace floating.
+        if not _from_reverse:
+            dispatch('movetoworkspacesilent', f'{target},address:{addr}')
+            if focus and str(target).lstrip('-').isdigit():
+                dispatch('workspace', str(target))
+            tx, ty, tw, th = self._taskbar_icon_rect(addr, meta.get('class'))
+            self._force_float_at(addr, tx, ty, tw, th)
+        # else: stay at current mid-shrink geom; expand from here
+
+        if focus:
+            dispatch('focuswindow', f'address:{addr}')
+
+        def _expand():
+            if addr not in self._anim or self._anim[addr].get('dir') != 'rest':
+                return False
+            self._set_geom(addr, at[0], at[1], size[0], size[1], animate=True)
+            return False
+
+        def _finish():
+            if addr not in self._anim or self._anim[addr].get('dir') != 'rest':
+                return False
+            self._anim_clear(addr)
+            # ensure not left in minimized map
+            self.minimized.pop(addr, None)
+            self.save_minimized()
+            if not was_floating:
+                self._settle_tiled(addr)
+            if was_fs:
+                dispatch('fullscreen', f'1,address:{addr}')
+            if focus:
+                dispatch('focuswindow', f'address:{addr}')
+            self.schedule_refresh()
+            return False
+
+        # reverse path: expand immediately (already mid-size); normal: tiny delay
+        self._anim_add_timer(addr, 16 if _from_reverse else 30, _expand)
+        self._anim_add_timer(addr, MIN_ANIM_MS + (20 if _from_reverse else 50),
+                             _finish)
+        self.schedule_refresh()
+
+    def focus(self, addr):
+        self.close_preview()
+        addr = norm_addr(addr)
+        if not addr:
+            return
+        if addr in self._anim:
+            # click during anim → reverse
+            self._reverse_anim(addr)
+            return
+        if self.is_addr_minimized(addr):
+            self.restore_window(addr, focus=True)
+            return
+        dispatch('focuswindow', f'address:{addr}')
+
+    def close_win(self, addr):
+        addr = norm_addr(addr)
+        if addr:
+            self.minimized.pop(addr, None)
+            self.save_minimized()
+            dispatch('closewindow', f'address:{addr}')
+
+    # ---------- preview window (own layer surface, always above) ----------
+    def ensure_preview(self):
+        if self.preview:
+            return
+        LS = GtkLayerShell
+        w = Gtk.Window(title='winbar-preview')
+        LS.init_for_window(w)
+        LS.set_layer(w, LS.Layer.TOP)
+        LS.set_anchor(w, LS.Edge.LEFT, True)
+        LS.set_anchor(w, LS.Edge.BOTTOM, True)
+        LS.set_margin(w, LS.Edge.BOTTOM, BAR_HEIGHT + 8)
+        LS.set_exclusive_zone(w, -1)
+        LS.set_namespace(w, 'winbar-preview')
+        if self.gdk_mon:
+            LS.set_monitor(w, self.gdk_mon)
+
+        visual = w.get_screen().get_rgba_visual()
+        if visual:
+            w.set_visual(visual)
+        w.set_app_paintable(True)
+
+        outer = Gtk.Box()
+        outer.get_style_context().add_class('previewcard')
+        self.preview_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(self.preview_box, f'set_margin_{m}')(10)
+        outer.add(self.preview_box)
+        w.add(outer)
+
+        w.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK
+                     | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        w.connect('enter-notify-event', self.on_pop_enter)
+        w.connect('leave-notify-event', self.on_pop_leave)
+        self.preview = w
+
+    def fill_preview(self, g):
+        sig = (g['id'],) + tuple(
+            (w['address'], w['title'],
+             self.thumb_cache.get(w['address'], (0,))[0]
+             if w['address'] in self.thumb_cache else
+             (os.path.getmtime(thumb_path(w['address']))
+              if os.path.exists(thumb_path(w['address'])) else 0))
+            for w in g['windows'])
+        if sig == self.fill_sig:
+            return
+        self.fill_sig = sig
+        for ch in self.preview_box.get_children():
+            self.preview_box.remove(ch)
+        for w in g['windows']:
+            self.preview_box.pack_start(
+                self.window_card(g, w), False, False, 0)
+        self.preview_box.show_all()
+
+    def window_card(self, g, w):
+        card = Gtk.Button()
+        card.get_style_context().add_class('wincard')
+        card.set_relief(Gtk.ReliefStyle.NONE)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        header.pack_start(self.icon_image(g, 16), False, False, 0)
+        title = w['title']
+        if len(title) > 26:
+            title = title[:24] + '…'
+        lbl = Gtk.Label(label=title)
+        lbl.get_style_context().add_class('cardtitle')
+        lbl.set_halign(Gtk.Align.START)
+        header.pack_start(lbl, True, True, 0)
+
+        close = Gtk.EventBox()
+        xl = Gtk.Label(label='✕')
+        xl.get_style_context().add_class('cardclose')
+        close.add(xl)
+        addr = w['address']
+        close.connect('button-press-event',
+                      lambda _w, _e, a=addr: self._card_close(a))
+        header.pack_start(close, False, False, 0)
+        vbox.pack_start(header, False, False, 0)
+
+        frame = Gtk.Box()
+        frame.get_style_context().add_class('thumbframe')
+        pix = self.thumb_pixbuf(addr)
+        if pix is not None:
+            img = Gtk.Image.new_from_pixbuf(pix)
+        else:
+            img = self.icon_image(g, 48)
+            img.set_size_request(THUMB_W, THUMB_H)
+        img.set_halign(Gtk.Align.CENTER)
+        img.set_valign(Gtk.Align.CENTER)
+        frame.set_size_request(THUMB_W, THUMB_H)
+        frame.pack_start(img, True, True, 0)
+        vbox.pack_start(frame, False, False, 0)
+
+        card.add(vbox)
+        card.connect('clicked', lambda _b, a=addr: self.focus(a))
+        return card
+
+    def _card_close(self, addr):
+        self.close_win(addr)
+        return True
+
+    def show_preview_for(self, btn):
+        g = btn._group
+        if not g['windows']:
+            return
+        self.ensure_preview()
+        self.pop_key = btn._key
+        self.fill_preview(g)
+
+        # center the preview above the icon
+        pw = self.preview.get_preferred_width()[1]
+        a = btn.get_allocation()
+        left = MARGIN_LEFT + a.x + a.width // 2 - pw // 2
+        left = max(8, min(left, self.mon_w - pw - 8))
+        GtkLayerShell.set_margin(self.preview, GtkLayerShell.Edge.LEFT,
+                                 int(left))
+        self.preview.show_all()
+
+    def close_preview(self):
+        self.cancel_timers()
+        if self.preview and self.preview.get_visible():
+            self.preview.hide()
+        self.pop_key = None
+        self.fill_sig = None
+        self.over_pop = False
+
+    # ----- hover management -----
+    def cancel_timers(self):
+        for t in ('hover_timer', 'hide_timer'):
+            tid = getattr(self, t)
+            if tid:
+                GLib.source_remove(tid)
+                setattr(self, t, None)
+
+    def on_btn_enter(self, btn, _event):
+        if self.drag_active:
+            return False
+        self.over_button = True
+        if self.hide_timer:
+            GLib.source_remove(self.hide_timer)
+            self.hide_timer = None
+        if self.hover_timer:
+            GLib.source_remove(self.hover_timer)
+            self.hover_timer = None
+        if not btn._group['windows']:
+            if self.pop_key:
+                self.close_preview()
+            return False
+        if self.pop_key and self.pop_key != btn._key:
+            self.show_preview_for(btn)      # slide preview to this app
+        else:
+            self.hover_timer = GLib.timeout_add(350, self._hover_show, btn)
+        return False
+
+    def _hover_show(self, btn):
+        self.hover_timer = None
+        if self.over_button and not self.drag_active:
+            self.show_preview_for(btn)
+        return False
+
+    def on_btn_leave(self, _btn, _event):
+        self.over_button = False
+        if self.hover_timer:
+            GLib.source_remove(self.hover_timer)
+            self.hover_timer = None
+        self._arm_hide()
+        return False
+
+    def on_pop_enter(self, _w, _event):
+        self.over_pop = True
+        if self.hide_timer:
+            GLib.source_remove(self.hide_timer)
+            self.hide_timer = None
+        return False
+
+    def on_pop_leave(self, _w, event):
+        if event.detail == Gdk.NotifyType.INFERIOR:
+            return False                    # moved onto a card, not out
+        self.over_pop = False
+        self._arm_hide()
+        return False
+
+    def _arm_hide(self):
+        if self.hide_timer:
+            GLib.source_remove(self.hide_timer)
+        self.hide_timer = GLib.timeout_add(300, self._maybe_hide)
+
+    def _maybe_hide(self):
+        self.hide_timer = None
+        if not self.over_button and not self.over_pop:
+            self.close_preview()
+        return False
+
+    # ----- right-click menu -----
+    def show_context_menu(self, btn, event):
+        self.close_preview()
+        g = btn._group
+        menu = Gtk.Menu()
+
+        name = g['info'].get_display_name() if g['info'] else (g['cls'] or '?')
+        head = Gtk.MenuItem(label=name)
+        head.set_sensitive(False)
+        menu.append(head)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        if g['info']:
+            mi = Gtk.MenuItem(label='Open new window')
+            mi.connect('activate', lambda _m: self.launch(g))
+            menu.append(mi)
+
+            if g['id'] in self.pinned:
+                mi = Gtk.MenuItem(label='Unpin from taskbar')
+                mi.connect('activate', lambda _m: self.unpin(g['id']))
+            else:
+                mi = Gtk.MenuItem(label='Pin to taskbar')
+                mi.connect('activate', lambda _m: self.pin(g['id']))
+            menu.append(mi)
+
+            mi = Gtk.MenuItem(label='Hide to tray')
+            mi.connect('activate', lambda _m: self.tray_tag(g['id']))
+            menu.append(mi)
+
+        if g['windows']:
+            menu.append(Gtk.SeparatorMenuItem())
+            # Minimize / Restore entries
+            any_min = any(self.is_addr_minimized(w['address'])
+                          for w in g['windows'])
+            any_vis = any(not self.is_addr_minimized(w['address'])
+                          for w in g['windows'])
+            if any_vis:
+                mi = Gtk.MenuItem(
+                    label='Minimize' if len(g['windows']) == 1
+                    else 'Minimize all')
+                mi.connect('activate',
+                           lambda _m: self.minimize_group(g))
+                menu.append(mi)
+            if any_min:
+                mi = Gtk.MenuItem(
+                    label='Restore' if len(g['windows']) == 1
+                    else 'Restore all')
+                mi.connect('activate',
+                           lambda _m: self.restore_group(g))
+                menu.append(mi)
+
+            label = ('Close window' if len(g['windows']) == 1
+                     else f"Close all {len(g['windows'])} windows")
+            mi = Gtk.MenuItem(label=label)
+            mi.connect('activate', lambda _m: self.close_all(g))
+            menu.append(mi)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def minimize_group(self, g):
+        for w in list(g.get('windows') or []):
+            if not self.is_addr_minimized(w['address']):
+                self.minimize_window(w['address'])
+
+    def restore_group(self, g):
+        for w in list(g.get('windows') or []):
+            if self.is_addr_minimized(w['address']):
+                self.restore_window(w['address'], focus=True)
+
+    def pin(self, app_id):
+        if app_id not in self.pinned:
+            self.pinned.append(app_id)
+            self.save_pinned()
+            self.refresh()
+
+    def unpin(self, app_id):
+        if app_id in self.pinned:
+            self.pinned.remove(app_id)
+            self.save_pinned()
+            self.refresh()
+
+    def close_all(self, g):
+        for w in g['windows']:
+            self.close_win(w['address'])
+
+
+if __name__ == '__main__':
+    if not os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
+        sys.exit('winbar-dock: not inside a Hyprland session')
+    Dock()
+    Gtk.main()

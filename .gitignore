@@ -1,0 +1,11 @@
+# local / build
+*.so
+*.o
+*~
+.DS_Store
+
+# never ship live user state
+config/winbar/pinned.json
+config/winbar/tray-apps.json
+config/winbar/desk-positions*.json
+config/winbar/night-step

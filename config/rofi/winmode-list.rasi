@@ -1,0 +1,44 @@
+/* ============================================================
+   WINDOWS MODE list popup (clipboard history, emoji picker) —
+   centered compact list. Inherits the palette from the start
+   menu theme, so `theme apply` restyles this automatically.
+   ============================================================ */
+
+@import "/home/beebit/.config/rofi/winmode-start.rasi"
+
+configuration {
+    modi: "drun";
+    show-icons: false;
+}
+
+window {
+    fullscreen: true;
+    background-color: transparent;
+    padding: calc(50% - 290px) calc(50% - 280px);
+}
+
+mainbox {
+    children: [ inputbar, listview ];
+}
+
+listview {
+    columns: 1;
+    lines: 11;
+    flow: vertical;
+    fixed-columns: false;
+    fixed-height: false;
+    spacing: 2px;
+    scrollbar: false;
+}
+
+element {
+    orientation: horizontal;
+    padding: 8px 12px;
+    spacing: 8px;
+    border-radius: 8px;
+}
+
+element-text {
+    horizontal-align: 0;
+    vertical-align: 0.5;
+}

@@ -1,0 +1,49 @@
+/* ============================================================
+   winbar theme overrides — Lavender
+   Loaded by winbar-dock + winbar-desk on top of their built-in
+   CSS. Swapped per-theme by `theme apply`.
+   ============================================================ */
+
+/* ---- taskbar (winbar-dock) ---- */
+button.appbtn:hover { background: rgba(183,148,246,0.13); }
+button.appbtn.active-app { background: rgba(183,148,246,0.18); }
+.ind.running { background: #5a5468; }
+.ind.active  { background: #b794f6; }
+.badge { background: #b794f6; color: #0a0810; }
+
+/* ---- hover preview cards ---- */
+.previewcard {
+    background: rgba(22,19,31,0.98);
+    border-color: rgba(183,148,246,0.25);
+}
+.previewcard label { color: #ebe6f4; }
+button.wincard {
+    background: rgba(183,148,246,0.05);
+    border-color: rgba(183,148,246,0.10);
+}
+button.wincard:hover {
+    background: rgba(183,148,246,0.14);
+    border-color: rgba(183,148,246,0.30);
+}
+button.wincard.altsel {
+    background: rgba(183,148,246,0.24);
+    border-color: #b794f6;
+}
+.cardclose { color: #9a92a8; }
+.cardclose:hover { color: #ffffff; background: rgba(183,148,246,0.40); }
+
+/* ---- desktop icons (winbar-desk) ---- */
+.deskicon:hover { background: rgba(183,148,246,0.14); }
+.deskicon.selected { background: rgba(183,148,246,0.30); }
+
+/* ---- right-click menus (both) ---- */
+menu, .menu {
+    background: rgba(22,19,31,0.98);
+    border-color: rgba(183,148,246,0.22);
+    color: #ebe6f4;
+}
+menu menuitem:hover, .menu menuitem:hover { background: rgba(183,148,246,0.16); }
+
+/* ---- quick settings ---- */
+scale highlight { background: #b794f6; }
+.qsbtn.on { background: #b794f6; color: #0a0810; }

@@ -1,0 +1,91 @@
+/* ============================================================
+   WINDOWS MODE search — centered list above the taskbar
+   ============================================================ */
+
+configuration {
+    modi: "drun";
+    show-icons: true;
+    icon-theme: "Papirus";
+    drun-display-format: "{name}";
+    display-drun: "";
+    hover-select: false;
+}
+
+* {
+    bg:      #1b1d24f5;
+    bg-alt:  #ffffff10;
+    fg:      #e8eaf0;
+    fg-dim:  #99a2b1;
+    accent:  #6cb8ff;
+
+    background-color: transparent;
+    text-color: @fg;
+    font: "Noto Sans 11";
+}
+
+window {
+    location: south;
+    anchor: south;
+    y-offset: -58px;
+    width: 680px;
+    background-color: @bg;
+    border: 1px;
+    border-color: #ffffff22;
+    border-radius: 12px;
+}
+
+mainbox {
+    padding: 16px;
+    spacing: 12px;
+    children: [ inputbar, listview ];
+}
+
+inputbar {
+    padding: 11px 16px;
+    background-color: @bg-alt;
+    border: 1px;
+    border-color: #ffffff14;
+    border-radius: 999px;
+    spacing: 10px;
+    children: [ textbox-prompt, entry ];
+}
+
+textbox-prompt {
+    expand: false;
+    str: "";
+    font: "Commit Mono Nerd Font 12";
+    text-color: @fg-dim;
+    vertical-align: 0.5;
+}
+
+entry {
+    placeholder: "Type here to search";
+    placeholder-color: @fg-dim;
+    vertical-align: 0.5;
+}
+
+listview {
+    lines: 8;
+    spacing: 3px;
+    scrollbar: false;
+}
+
+element {
+    padding: 8px 12px;
+    spacing: 12px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+element selected {
+    background-color: #ffffff16;
+}
+
+element-icon {
+    size: 28px;
+    cursor: inherit;
+}
+element-text {
+    vertical-align: 0.5;
+    text-color: inherit;
+    cursor: inherit;
+}

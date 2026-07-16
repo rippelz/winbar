@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Launch rofi with a freshly recency-sorted app list.
+set -u
+# Update ~/.cache/rofi3.druncache from real recent usage
+"$HOME/.local/bin/app-recency" sync >/dev/null 2>&1 || true
+exec rofi "$@"

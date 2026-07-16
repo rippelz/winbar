@@ -1,0 +1,826 @@
+#!/usr/bin/env python3
+# ============================================================
+# winbar-desk — per-MONITOR desktop icons for Hyprland winmode.
+#
+# One layer surface per monitor (bottom layer: above wallpaper,
+# below windows), each showing its OWN folder:
+#     monitor 1 (leftmost)  ->  ~/Desktop
+#     monitor 2             ->  ~/Desktop-2
+#
+#   - drag icons to arrange (grid snap, positions persist)
+#   - double-click to open (desktop entries run directly)
+#   - right-click icon: Open / Send to other monitor / Rename /
+#     Move to Trash
+#   - right-click empty: New Folder / Open in File Manager /
+#     Sort icons / Refresh
+#   - image files get real thumbnails
+#
+# Positions: ~/.config/winbar/desk-positions-<n>.json
+# ============================================================
+
+import ctypes
+import json
+import os
+import sys
+
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    libc.prctl(15, b'winbar-desk', 0, 0, 0)  # PR_SET_NAME
+except Exception:
+    pass
+
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, Gdk, GLib, Gio, GdkPixbuf, GtkLayerShell, Pango  # noqa: E402
+
+CELL_W, CELL_H = 100, 106
+PAD_X, PAD_Y = 14, 14
+ICON_SIZE = 48
+ICON_W, ICON_H = 84, 84   # icon+label hit/highlight box (square)
+DRAG_THRESHOLD = 8
+
+CONFIG_DIR = os.path.expanduser('~/.config/winbar')
+FOLDERS = [os.path.expanduser('~/Desktop'),
+           os.path.expanduser('~/Desktop-2')]
+
+CSS = b"""
+window { background: transparent; }
+.deskicon { background: transparent; border-radius: 8px; }
+.deskicon:hover { background: rgba(255,255,255,0.10); }
+.deskicon.selected { background: rgba(108,184,255,0.28); }
+.desklabel {
+    color: #ffffff;
+    font-size: 11.5px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.6);
+}
+.ctxmenu {
+    background: rgba(28,30,38,0.98);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 4px;
+}
+.ctxitem {
+    color: #e8eaf0;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    min-height: 0;
+    min-width: 150px;
+    padding: 6px 16px;
+    border-radius: 5px;
+    font-size: 12px;
+}
+.ctxitem:hover { background: rgba(255,255,255,0.12); }
+.ctxsep {
+    background: rgba(255,255,255,0.10);
+    min-height: 1px;
+    margin: 4px 6px;
+}
+"""
+
+
+def launch_path(path):
+    """Open a file/folder; run .desktop entries directly (no prompt)."""
+    if path.endswith('.desktop'):
+        try:
+            info = Gio.DesktopAppInfo.new_from_filename(path)
+            if info:
+                info.launch(None, None)
+                return
+        except Exception:
+            pass
+    try:
+        Gio.AppInfo.launch_default_for_uri(
+            Gio.File.new_for_path(path).get_uri(), None)
+    except Exception:
+        pass
+
+
+def display_name(path):
+    base = os.path.basename(path)
+    if base.endswith('.desktop'):
+        try:
+            info = Gio.DesktopAppInfo.new_from_filename(path)
+            if info:
+                return info.get_display_name()
+        except Exception:
+            pass
+        return base[:-8]
+    return base
+
+
+def gicon_for_path(path):
+    if path.endswith('.desktop'):
+        try:
+            info = Gio.DesktopAppInfo.new_from_filename(path)
+            if info and info.get_icon():
+                return info.get_icon()
+        except Exception:
+            pass
+    try:
+        fi = Gio.File.new_for_path(path).query_info(
+            'standard::icon', Gio.FileQueryInfoFlags.NONE, None)
+        return fi.get_icon()
+    except Exception:
+        return Gio.ThemedIcon.new('text-x-generic')
+
+
+def image_thumb(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg'):
+        return None
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            path, ICON_SIZE + 12, ICON_SIZE, True)
+    except Exception:
+        return None
+
+
+class DeskIcon(Gtk.EventBox):
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.get_style_context().add_class('deskicon')
+        # square highlight box that hugs the icon+label
+        self.set_size_request(ICON_W, ICON_H)
+        self.set_valign(Gtk.Align.START)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        vbox.set_valign(Gtk.Align.CENTER)
+        vbox.set_margin_top(6)
+        vbox.set_margin_bottom(5)
+
+        pix = image_thumb(path)
+        if pix is not None:
+            img = Gtk.Image.new_from_pixbuf(pix)
+        else:
+            img = Gtk.Image.new_from_gicon(gicon_for_path(path),
+                                           Gtk.IconSize.INVALID)
+            img.set_pixel_size(ICON_SIZE)
+        vbox.pack_start(img, False, False, 0)
+
+        lbl = Gtk.Label(label=display_name(path))
+        lbl.get_style_context().add_class('desklabel')
+        lbl.set_justify(Gtk.Justification.CENTER)
+        lbl.set_line_wrap(True)
+        lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lbl.set_lines(2)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(12)
+        vbox.pack_start(lbl, False, False, 0)
+
+        self.add(vbox)
+
+    def set_selected(self, sel):
+        ctx = self.get_style_context()
+        (ctx.add_class if sel else ctx.remove_class)('selected')
+
+
+class DeskWindow(Gtk.Window):
+    def __init__(self, gdk_mon, index, folder, other_folder, mon_label):
+        super().__init__(title=f'winbar-desk-{index}')
+        self.gdk_mon = gdk_mon
+        self.folder = folder
+        self.other_folder = other_folder
+        self.mon_label = mon_label
+        self.index = index
+        self.pos_file = os.path.join(CONFIG_DIR,
+                                     f'desk-positions-{index}.json')
+        self.positions = self.load_positions()
+        self.icons = {}           # basename -> DeskIcon
+        self.selected = None
+        self.selected_names = set()   # rubber-band multi-selection
+
+        self.press_icon = None
+        self.press_pos = (0, 0)
+        self.press_off = (0, 0)
+        self.dragging = False
+        self.refresh_pending = False
+
+        # rubber-band selection state
+        self.band_active = False
+        self.band_start = (0, 0)
+        self.band_rect = None         # (x, y, w, h) or None
+
+        # context-menu state (one at a time; guard against the duplicate
+        # button-release this layer surface delivers ~2ms apart)
+        self._menu_win = None
+        self._menu_t = 0.0
+
+        os.makedirs(folder, exist_ok=True)
+
+        LS = GtkLayerShell
+        LS.init_for_window(self)
+        LS.set_layer(self, LS.Layer.BOTTOM)   # above wallpaper, below windows
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, 0)        # shrink around the taskbar
+        LS.set_namespace(self, 'winbar-desk')
+        # ON_DEMAND lets this BOTTOM-layer surface take focus on click so
+        # right-click menus can grab a popup — without it GTK renders a
+        # ghost menu copy at the top-left corner.
+        if hasattr(LS, 'set_keyboard_mode'):
+            LS.set_keyboard_mode(self, LS.KeyboardMode.ON_DEMAND)
+        LS.set_monitor(self, gdk_mon)
+
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.set_app_paintable(True)
+
+        self.fixed = Gtk.Fixed()
+        self.add(self.fixed)
+
+        self.set_can_focus(True)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.BUTTON1_MOTION_MASK
+                        | Gdk.EventMask.KEY_PRESS_MASK)
+        self.connect('button-press-event', self.on_bg_press)
+        self.connect('motion-notify-event', self.on_bg_motion)
+        self.connect('button-release-event', self.on_bg_release)
+        self.connect('key-press-event', self.on_key)
+        # draw the rubber-band rectangle (behind icons); return False so
+        # the default handler still draws the Fixed's icon children on top
+        self.connect('draw', self.on_draw)
+
+        # watch the folder for changes
+        self.monitor = Gio.File.new_for_path(folder).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect('changed', self.on_folder_changed)
+
+        self.connect('size-allocate', self.on_size_allocate)
+        self._alloc = (0, 0)
+        self.show_all()
+        GLib.idle_add(self.refresh)
+
+    # ---------- geometry ----------
+    def on_size_allocate(self, _w, alloc):
+        if (alloc.width, alloc.height) != self._alloc:
+            self._alloc = (alloc.width, alloc.height)
+            GLib.idle_add(self.refresh)
+
+    def grid_dims(self):
+        w = max(self._alloc[0], CELL_W + 2 * PAD_X)
+        h = max(self._alloc[1], CELL_H + 2 * PAD_Y)
+        cols = max(1, (w - 2 * PAD_X) // CELL_W)
+        rows = max(1, (h - 2 * PAD_Y) // CELL_H)
+        return int(cols), int(rows)
+
+    def cell_to_xy(self, col, row):
+        # center the (square) icon box within its grid cell
+        return (PAD_X + col * CELL_W + (CELL_W - ICON_W) // 2,
+                PAD_Y + row * CELL_H + (CELL_H - ICON_H) // 2)
+
+    def xy_to_cell(self, x, y):
+        cols, rows = self.grid_dims()
+        col = round((x - PAD_X) / CELL_W)
+        row = round((y - PAD_Y) / CELL_H)
+        return max(0, min(cols - 1, col)), max(0, min(rows - 1, row))
+
+    # ---------- positions ----------
+    def load_positions(self):
+        try:
+            with open(self.pos_file) as f:
+                return {k: tuple(v) for k, v in json.load(f).items()}
+        except Exception:
+            return {}
+
+    def save_positions(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(self.pos_file, 'w') as f:
+            json.dump({k: list(v) for k, v in self.positions.items()}, f,
+                      indent=2)
+
+    def next_free_cell(self, taken):
+        cols, rows = self.grid_dims()
+        for col in range(cols):
+            for row in range(rows):
+                if (col, row) not in taken:
+                    return (col, row)
+        return (0, 0)
+
+    # ---------- model ----------
+    def list_files(self):
+        try:
+            names = [n for n in os.listdir(self.folder)
+                     if not n.startswith('.')]
+        except OSError:
+            names = []
+        names.sort(key=str.lower)
+        return names
+
+    def on_folder_changed(self, *_a):
+        if not self.refresh_pending:
+            self.refresh_pending = True
+            GLib.timeout_add(250, self._do_refresh)
+
+    def _do_refresh(self):
+        self.refresh_pending = False
+        self.refresh()
+        return False
+
+    def refresh(self):
+        if self._alloc[0] <= 1:
+            return False
+        names = self.list_files()
+        nameset = set(names)
+
+        for name in list(self.icons):
+            if name not in nameset:
+                self.fixed.remove(self.icons.pop(name))
+                self.positions.pop(name, None)
+
+        taken = {tuple(v) for k, v in self.positions.items()
+                 if k in nameset}
+        changed = False
+        for name in names:
+            cell = self.positions.get(name)
+            if cell is None:
+                cell = self.next_free_cell(taken)
+                taken.add(cell)
+                self.positions[name] = cell
+                changed = True
+            icon = self.icons.get(name)
+            x, y = self.cell_to_xy(*self.positions[name])
+            if icon is None:
+                icon = self.icons[name] = self.make_icon(name)
+                self.fixed.put(icon, x, y)
+            else:
+                self.fixed.move(icon, x, y)
+        if changed:
+            self.save_positions()
+        self.fixed.show_all()
+        return False
+
+    def make_icon(self, name):
+        icon = DeskIcon(os.path.join(self.folder, name))
+        icon.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.BUTTON1_MOTION_MASK)
+        icon.connect('button-press-event', self.on_icon_press, name)
+        icon.connect('button-release-event', self.on_icon_release, name)
+        icon.connect('motion-notify-event', self.on_icon_motion, name)
+        return icon
+
+    # ---------- selection ----------
+    def clear_selection(self):
+        for n in list(self.selected_names):
+            if n in self.icons:
+                self.icons[n].set_selected(False)
+        self.selected_names.clear()
+        if self.selected and self.selected in self.icons:
+            self.icons[self.selected].set_selected(False)
+        self.selected = None
+
+    def select(self, name):
+        self.clear_selection()
+        self.selected = name
+        if name and name in self.icons:
+            self.icons[name].set_selected(True)
+            self.selected_names.add(name)
+
+    def select_all(self):
+        self.clear_selection()
+        for n, icon in self.icons.items():
+            icon.set_selected(True)
+            self.selected_names.add(n)
+        self.selected = None
+
+    # ---------- keyboard ----------
+    def on_key(self, _w, event):
+        kv = event.keyval
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+
+        if kv == Gdk.KEY_a and ctrl:
+            self.select_all()
+            return True
+        if kv == Gdk.KEY_Escape:
+            self.clear_selection()
+            return True
+        if kv in (Gdk.KEY_Left, Gdk.KEY_Right, Gdk.KEY_Up, Gdk.KEY_Down):
+            self.move_selection(kv)
+            return True
+        if kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            for n in (list(self.selected_names) or
+                      ([self.selected] if self.selected else [])):
+                if n in self.icons:
+                    launch_path(self.icons[n].path)
+            return True
+        if kv == Gdk.KEY_F2 and self.selected:
+            self.rename_dialog(self.selected)
+            return True
+        if kv in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            targets = list(self.selected_names) or (
+                [self.selected] if self.selected else [])
+            for n in targets:
+                self.trash(n)
+            self.clear_selection()
+            return True
+        return False
+
+    def move_selection(self, kv):
+        cells = {n: tuple(self.positions[n]) for n in self.icons
+                 if n in self.positions}
+        if not cells:
+            return
+        cur = self.selected if self.selected in cells else None
+        if cur is None:
+            # nothing selected yet → pick the top-left icon
+            first = min(cells, key=lambda n: (cells[n][1], cells[n][0]))
+            self.select(first)
+            return
+        ccol, crow = cells[cur]
+        best, bestkey = None, None
+        for n, (col, row) in cells.items():
+            if n == cur:
+                continue
+            dx, dy = col - ccol, row - crow
+            if kv == Gdk.KEY_Left and dx < 0:
+                primary, cross = -dx, abs(dy)
+            elif kv == Gdk.KEY_Right and dx > 0:
+                primary, cross = dx, abs(dy)
+            elif kv == Gdk.KEY_Up and dy < 0:
+                primary, cross = -dy, abs(dx)
+            elif kv == Gdk.KEY_Down and dy > 0:
+                primary, cross = dy, abs(dx)
+            else:
+                continue
+            key = (cross, primary)   # same row/col first, then nearest
+            if bestkey is None or key < bestkey:
+                bestkey, best = key, n
+        if best:
+            self.select(best)
+
+    # ---------- icon interactions ----------
+    def on_icon_press(self, icon, event, name):
+        self.grab_focus()   # take keyboard focus for arrow/Del/F2 nav
+        if event.button == 1:
+            self.select(name)
+            if event.type == Gdk.EventType._2BUTTON_PRESS:
+                launch_path(icon.path)
+                self.press_icon = None
+                return True
+            self.press_icon = name
+            self.press_pos = (event.x_root, event.y_root)
+            self.press_off = (event.x, event.y)
+            self.dragging = False
+            return True
+        if event.button == 3:
+            # open on release so the button isn't held when the popup maps
+            # (a held grab makes the first click on the popup a no-op)
+            self.select(name)
+            return True
+        return False
+
+    def on_icon_motion(self, icon, event, name):
+        if self.press_icon != name:
+            return False
+        if not self.dragging:
+            dx = abs(event.x_root - self.press_pos[0])
+            dy = abs(event.y_root - self.press_pos[1])
+            if max(dx, dy) < DRAG_THRESHOLD:
+                return False
+            self.dragging = True
+            icon.set_opacity(0.65)
+        # x_root/y_root are surface-relative on wayland == our window coords
+        nx = event.x_root - self.press_off[0]
+        ny = event.y_root - self.press_off[1]
+        self.fixed.move(icon, int(nx), int(ny))
+        return True
+
+    def on_icon_release(self, icon, event, name):
+        if event.button == 3:
+            self.icon_menu(icon, event, name)
+            return True
+        if self.press_icon != name:
+            return False
+        self.press_icon = None
+        if not self.dragging:
+            return False
+        self.dragging = False
+        icon.set_opacity(1.0)
+        drop_x = event.x_root - self.press_off[0]
+        drop_y = event.y_root - self.press_off[1]
+        cell = self.xy_to_cell(drop_x, drop_y)
+        # if occupied by another icon, find nearest free cell
+        taken = {tuple(v) for k, v in self.positions.items() if k != name}
+        if cell in taken:
+            cols, rows = self.grid_dims()
+            best, bestd = None, None
+            for c in range(cols):
+                for r in range(rows):
+                    if (c, r) in taken:
+                        continue
+                    d = (c - cell[0]) ** 2 + (r - cell[1]) ** 2
+                    if bestd is None or d < bestd:
+                        best, bestd = (c, r), d
+            cell = best or cell
+        self.positions[name] = cell
+        self.fixed.move(icon, *self.cell_to_xy(*cell))
+        self.save_positions()
+        return True
+
+    # ---------- background interactions ----------
+    def on_bg_press(self, _w, event):
+        # only reach here when clicking empty space (icons handle theirs)
+        self.grab_focus()   # take keyboard focus for arrow/Del/F2 nav
+        if event.button == 1:
+            self.clear_selection()
+            self.band_active = True
+            self.band_start = (event.x, event.y)
+            self.band_rect = None
+        # button 3 opens on release (see on_bg_release) so the button isn't
+        # held when the popup maps
+        return False
+
+    def on_bg_motion(self, _w, event):
+        if not self.band_active:
+            return False
+        x0, y0 = self.band_start
+        x1, y1 = event.x, event.y
+        rx, ry = min(x0, x1), min(y0, y1)
+        rw, rh = abs(x1 - x0), abs(y1 - y0)
+        self.band_rect = (rx, ry, rw, rh)
+        self.band_select(rx, ry, rw, rh)
+        self.queue_draw()
+        return True
+
+    def on_bg_release(self, _w, event):
+        if event.button == 3:
+            self.bg_menu(event)
+            return False
+        if not self.band_active:
+            return False
+        self.band_active = False
+        self.band_rect = None
+        self.queue_draw()
+        return False
+
+    def band_select(self, rx, ry, rw, rh):
+        """Highlight every icon whose cell rectangle intersects the band."""
+        iw, ih = ICON_W, ICON_H
+        for name, icon in self.icons.items():
+            cell = self.positions.get(name)
+            if cell is None:
+                continue
+            ix, iy = self.cell_to_xy(*cell)
+            hit = not (rx > ix + iw or rx + rw < ix
+                       or ry > iy + ih or ry + rh < iy)
+            icon.set_selected(hit)
+            if hit:
+                self.selected_names.add(name)
+            else:
+                self.selected_names.discard(name)
+        # rubber-band picks a set; no single "primary" selection
+        self.selected = None
+
+    def on_draw(self, _w, cr):
+        if self.band_rect is not None:
+            x, y, w, h = self.band_rect
+            cr.rectangle(x, y, w, h)
+            cr.set_source_rgba(0.42, 0.72, 1.0, 0.22)
+            cr.fill_preserve()
+            cr.set_source_rgba(0.42, 0.72, 1.0, 0.85)
+            cr.set_line_width(1.0)
+            cr.stroke()
+        return False   # let icons draw on top
+
+    # ---------- menus ----------
+    # NOTE: GtkMenu on a BOTTOM-layer gtk-layer-shell surface renders a
+    # persistent ghost copy at (0,0). We draw our own cursor-positioned
+    # OVERLAY layer-shell popup instead, which sidesteps that entirely.
+    def popup_menu(self, event, items):
+        """items: list of (label, callback) tuples, or None for a separator."""
+        import time as _t
+        now = _t.monotonic()
+        # this layer surface delivers the button-release twice (~2ms apart);
+        # debounce so a single right-click doesn't stack two menus
+        if now - self._menu_t < 0.15:
+            return
+        self._menu_t = now
+        # never allow more than one menu open at a time
+        if self._menu_win is not None:
+            try:
+                self._menu_win.destroy()
+            except Exception:
+                pass
+            self._menu_win = None
+
+        LS = GtkLayerShell
+        win = Gtk.Window(title='winbar-desk-menu')
+        LS.init_for_window(win)
+        LS.set_layer(win, LS.Layer.OVERLAY)
+        if self.gdk_mon:
+            LS.set_monitor(win, self.gdk_mon)
+        for e in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT):
+            LS.set_anchor(win, e, True)
+        LS.set_exclusive_zone(win, -1)     # cover the monitor for click-away
+        LS.set_namespace(win, 'winbar-desk-menu')
+        # keyboard NONE: the transparent catcher must NOT take keyboard focus,
+        # or opening the menu steals focus from the app you're working in.
+        if hasattr(LS, 'set_keyboard_mode'):
+            LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)
+
+        visual = win.get_screen().get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+        win.set_app_paintable(True)
+        self._menu_win = win
+
+        fixed = Gtk.Fixed()
+        win.add(fixed)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.get_style_context().add_class('ctxmenu')
+
+        def close(*_a):
+            self._menu_win = None
+            if win.get_realized() or win.get_visible():
+                win.destroy()
+
+        for it in items:
+            if it is None:
+                sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+                sep.get_style_context().add_class('ctxsep')
+                box.pack_start(sep, False, False, 0)
+                continue
+            label, cb = it
+            btn = Gtk.Button(label=label)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.get_child().set_halign(Gtk.Align.START)
+            btn.get_style_context().add_class('ctxitem')
+
+            def on_click(_b, cb=cb):
+                close()
+                cb()
+            btn.connect('clicked', on_click)
+            box.pack_start(btn, False, False, 0)
+
+        # visible-window wrapper: its GdkWindow is sized to the menu, so it
+        # swallows clicks ONLY over the menu; clicks anywhere else fall
+        # through to the transparent catcher window and dismiss it
+        ebox = Gtk.EventBox()
+        ebox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        ebox.connect('button-press-event', lambda *_a: True)
+        ebox.add(box)
+
+        _, natw = box.get_preferred_width()
+        _, nath = box.get_preferred_height()
+        mw, mh = self._alloc if self._alloc[0] > 1 else (1920, 1080)
+        px = max(0, min(int(event.x_root), mw - natw - 2))
+        py = max(0, min(int(event.y_root), mh - nath - 2))
+        fixed.put(ebox, px, py)
+
+        win.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        win.connect('button-press-event', lambda _w, _e: (close(), True)[1])
+        win.connect('destroy', lambda _w: setattr(self, '_menu_win', None))
+        win.show_all()
+
+    def icon_menu(self, icon, event, name):
+        path = icon.path
+        items = [('Open', lambda: launch_path(path))]
+        if os.path.isdir(path):
+            items.append(('Open in File Manager', lambda: launch_path(path)))
+        items += [
+            None,
+            (f'Send to {self.mon_label}', lambda: self.send_other(name)),
+            ('Rename…', lambda: self.rename_dialog(name)),
+            None,
+            ('Move to Trash', lambda: self.trash(name)),
+        ]
+        self.popup_menu(event, items)
+
+    def bg_menu(self, event):
+        items = [
+            ('New Folder', lambda: self.new_folder()),
+            ('Open in File Manager', lambda: launch_path(self.folder)),
+            None,
+            ('Sort Icons by Name', lambda: self.sort_icons()),
+            ('Refresh', lambda: self.refresh()),
+        ]
+        self.popup_menu(event, items)
+
+    # ---------- file ops ----------
+    def send_other(self, name):
+        os.makedirs(self.other_folder, exist_ok=True)
+        src = os.path.join(self.folder, name)
+        dst = os.path.join(self.other_folder, name)
+        if os.path.exists(dst):
+            stem, ext = os.path.splitext(name)
+            i = 2
+            while os.path.exists(os.path.join(self.other_folder,
+                                              f'{stem} ({i}){ext}')):
+                i += 1
+            dst = os.path.join(self.other_folder, f'{stem} ({i}){ext}')
+        try:
+            os.rename(src, dst)
+        except OSError:
+            pass
+        self.refresh()
+
+    def trash(self, name):
+        try:
+            Gio.File.new_for_path(
+                os.path.join(self.folder, name)).trash(None)
+        except Exception:
+            pass
+
+    def new_folder(self):
+        base = os.path.join(self.folder, 'New Folder')
+        target = base
+        i = 2
+        while os.path.exists(target):
+            target = f'{base} {i}'
+            i += 1
+        try:
+            os.makedirs(target)
+        except OSError:
+            pass
+
+    def sort_icons(self):
+        self.positions.clear()
+        for icon in self.icons.values():
+            self.fixed.remove(icon)
+        self.icons.clear()
+        self.save_positions()
+        self.refresh()
+
+    def rename_dialog(self, name):
+        dlg = Gtk.Dialog(title='Rename', modal=False)
+        dlg.add_button('Cancel', Gtk.ResponseType.CANCEL)
+        dlg.add_button('Rename', Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        entry = Gtk.Entry(text=name)
+        entry.set_activates_default(True)
+        entry.set_margin_top(10)
+        entry.set_margin_bottom(10)
+        entry.set_margin_start(10)
+        entry.set_margin_end(10)
+        entry.set_width_chars(34)
+        dlg.get_content_area().add(entry)
+        dlg.show_all()
+
+        def on_resp(d, resp):
+            if resp == Gtk.ResponseType.OK:
+                new = entry.get_text().strip()
+                if new and new != name and '/' not in new:
+                    try:
+                        os.rename(os.path.join(self.folder, name),
+                                  os.path.join(self.folder, new))
+                        if name in self.positions:
+                            self.positions[new] = self.positions.pop(name)
+                            self.save_positions()
+                    except OSError:
+                        pass
+            d.destroy()
+
+        dlg.connect('response', on_resp)
+
+
+def main():
+    if not os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
+        sys.exit('winbar-desk: not inside a Hyprland session')
+
+    screen = Gdk.Screen.get_default()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # per-theme color overrides, swapped by `theme apply`
+    theme_css = os.path.expanduser('~/.config/winbar/theme.css')
+    if os.path.exists(theme_css):
+        try:
+            tp = Gtk.CssProvider()
+            tp.load_from_path(theme_css)
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, tp, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        except Exception:
+            pass
+
+    display = Gdk.Display.get_default()
+    mons = []
+    for i in range(display.get_n_monitors()):
+        m = display.get_monitor(i)
+        geo = m.get_geometry()
+        mons.append((geo.x, geo.y, m))
+    mons.sort(key=lambda t: (t[0], t[1]))   # leftmost first
+
+    wins = []
+    for idx, (_x, _y, m) in enumerate(mons[:len(FOLDERS)]):
+        folder = FOLDERS[idx]
+        other = FOLDERS[1 - idx] if len(mons) > 1 and idx < 2 else FOLDERS[0]
+        label = 'Monitor 2' if idx == 0 else 'Monitor 1'
+        wins.append(DeskWindow(m, idx + 1, folder, other, label))
+
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

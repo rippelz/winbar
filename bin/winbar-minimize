@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# winbar-minimize — minimize helpers used by winmode / winbar-dock.
+# Commands:
+#   restore-all   restore every window parked on special:minimized
+#                 (and clear ~/.local/state/winmode/minimized.json)
+#   status        print minimized map as JSON
+set -u
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/winmode"
+STATE_FILE="$STATE_DIR/minimized.json"
+MIN_WS="special:minimized"
+
+mkdir -p "$STATE_DIR"
+[ -f "$STATE_FILE" ] || echo '{}' > "$STATE_FILE"
+
+cmd="${1:-status}"
+
+case "$cmd" in
+  restore-all)
+    python3 - <<'PY'
+import json, os, subprocess
+
+state_path = os.path.expanduser(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+    + "/winmode/minimized.json"
+)
+try:
+    with open(state_path) as f:
+        state = json.load(f)
+except Exception:
+    state = {}
+
+try:
+    clients = json.loads(subprocess.check_output(
+        ["hyprctl", "-j", "clients"], text=True))
+except Exception:
+    clients = []
+
+def run(*args):
+    subprocess.run(["hyprctl", *args], capture_output=True)
+
+# normalize keys (0x...)
+state_n = {}
+for k, v in state.items():
+    a = k if str(k).startswith("0x") else "0x" + str(k)
+    state_n[a] = v
+
+addrs = set()
+for c in clients:
+    ws = (c.get("workspace") or {}).get("name") or ""
+    addr = c.get("address")
+    if not addr:
+        continue
+    if ws == "special:minimized" or addr in state_n:
+        addrs.add(addr)
+
+for addr in addrs:
+    meta = state_n.get(addr) or {}
+    dest = meta.get("workspace") or meta.get("ws_name") or "1"
+    if isinstance(dest, str) and dest.startswith("special:"):
+        dest = 1
+    target = str(dest)
+
+    run("dispatch", "movetoworkspacesilent", f"{target},address:{addr}")
+
+    at = meta.get("at")
+    size = meta.get("size")
+    floating = bool(meta.get("floating"))
+    fs = int(meta.get("fullscreen") or 0)
+
+    if at and size and len(at) >= 2 and len(size) >= 2:
+        # snap geometry without animation, then restore float/tile
+        run("--batch",
+            "keyword animations:enabled false;"
+            f"dispatch setfloating address:{addr};"
+            f"dispatch resizewindowpixel exact {int(size[0])} {int(size[1])},"
+            f"address:{addr};"
+            f"dispatch movewindowpixel exact {int(at[0])} {int(at[1])},"
+            f"address:{addr};"
+            "keyword animations:enabled true")
+    if not floating:
+        run("dispatch", "settiled", f"address:{addr}")
+    if fs:
+        run("dispatch", "fullscreen", f"1,address:{addr}")
+
+with open(state_path, "w") as f:
+    json.dump({}, f)
+print("ok")
+PY
+    ;;
+  status)
+    cat "$STATE_FILE"
+    echo
+    ;;
+  *)
+    echo "usage: $0 restore-all|status" >&2
+    exit 1
+    ;;
+esac

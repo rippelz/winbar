@@ -1,0 +1,88 @@
+{
+	"layer": "overlay",
+	"position": "bottom",
+	"height": 48,
+	"exclusive": true,
+	"spacing": 0,
+	"margin": "0",
+	"modules-left": [
+		"custom/start",
+		"custom/search"
+	],
+	"modules-center": [],
+	"modules-right": [
+		"custom/chevron",
+		"tray",
+		"custom/hyprmode",
+		"network",
+		"pulseaudio",
+		"clock",
+		"custom/showdesktop"
+	],
+	"custom/start": {
+		"format": "",
+		"tooltip-format": "Start  (right-click: power menu)",
+		"on-click": "~/.local/bin/winbar-msg start",
+		"on-click-right": "~/.config/waybar/scripts/power-menu.sh"
+	},
+	"custom/search": {
+		"format": "   Search",
+		"tooltip": false,
+		"on-click": "~/.local/bin/winbar-msg start"
+	},
+	"custom/chevron": {
+		"format": "󰅃",
+		"tooltip-format": "Hidden tray apps",
+		"on-click": "~/.local/bin/winbar-msg tray"
+	},
+	"tray": {
+		"icon-size": 18,
+		"spacing": 10
+	},
+	"custom/hyprmode": {
+		"format": "",
+		"tooltip-format": "Exit Windows mode → back to Hyprland",
+		"on-click": "~/.local/bin/winmode"
+	},
+	"network": {
+		"format-wifi": "",
+		"format-ethernet": "󰈀",
+		"format-linked": "󰈀",
+		"format-disconnected": "󰖪",
+		"on-click": "~/.local/bin/winbar-msg quick",
+		"tooltip-format": "{ifname}: {ipaddr}",
+		"tooltip-format-wifi": "{essid} ({signalStrength}%)"
+	},
+	"pulseaudio": {
+		"format": "{icon}",
+		"format-muted": "󰝟",
+		"format-icons": {
+			"default": [
+				"󰕿",
+				"󰖀",
+				"󰕾"
+			]
+		},
+		"on-click": "~/.local/bin/winbar-msg quick",
+		"on-click-right": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+		"on-scroll-up": "wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 2%+",
+		"on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 2%-",
+		"tooltip-format": "Volume: {volume}% (right-click: mute)"
+	},
+	"clock": {
+		"format": "{:%I:%M %p\n%m/%d/%Y}",
+		"justify": "center",
+		"tooltip-format": "<tt><small>{calendar}</small></tt>",
+		"calendar": {
+			"mode": "month",
+			"format": {
+				"today": "<b><span color='#6cb8ff'>{}</span></b>"
+			}
+		}
+	},
+	"custom/showdesktop": {
+		"format": " ",
+		"tooltip-format": "Show desktop",
+		"on-click": "hyprctl dispatch workspace empty"
+	}
+}
