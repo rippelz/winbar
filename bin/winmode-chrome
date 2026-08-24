@@ -25,6 +25,14 @@ LOCK="${STATE_DIR}/chrome.lock"
 WB_DIR="${HOME}/.config/waybar"
 WB_WIN_C="${WB_DIR}/windows/config.jsonc"
 WB_WIN_S="${WB_DIR}/windows/style.css"
+# Prefer patched hyprpaper-era waybar (CSS hot-swap on SIGUSR2). Bare
+# `waybar` often resolves to /usr/bin in hypr exec PATH → first theme
+# apply then kill+restarts it (top bar flash after leaving winmode).
+if [ -x "${HOME}/.local/bin/waybar" ]; then
+    WAYBAR="${HOME}/.local/bin/waybar"
+else
+    WAYBAR="$(command -v waybar 2>/dev/null || echo waybar)"
+fi
 DOCK="${HOME}/.local/bin/winbar-dock"
 DESK="${HOME}/.local/bin/winbar-desk"
 SELF="${HOME}/.local/bin/winmode-chrome"
@@ -81,11 +89,11 @@ spawn() {
 }
 
 start_waybar_win() {
-    spawn waybar -c "$WB_WIN_C" -s "$WB_WIN_S"
+    spawn "$WAYBAR" -c "$WB_WIN_C" -s "$WB_WIN_S"
 }
 
 start_waybar_normal() {
-    spawn waybar
+    spawn "$WAYBAR"
 }
 
 start_dock() {

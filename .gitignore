@@ -9,3 +9,6 @@ config/winbar/pinned.json
 config/winbar/tray-apps.json
 config/winbar/desk-positions*.json
 config/winbar/night-step
+
+# python
+__pycache__/

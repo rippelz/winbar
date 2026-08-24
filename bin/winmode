@@ -33,10 +33,9 @@ EOF
     "$CHROME" leave
 else
     # ---------- ON → Windows-style desktop ----------
-    # infini + winmode chrome fight (Super+F bar/icons). Leave canvas first.
-    if [ -e "$HOME/.local/state/infiniscroll/on" ]; then
-        "$HOME/.local/bin/infiniscroll" >/dev/null 2>&1 || true
-    fi
+    # Coexists with infiniscroll: canvas tools only move client windows;
+    # dock/desk/start are layer surfaces. Super+F cover hides/restores
+    # chrome via infiniscroll-snap.
 
     if [ -f "$HOME/.local/lib/hypr-minimize.so" ]; then
         hyprctl plugin list 2>/dev/null | grep -q 'hypr-minimize' || \

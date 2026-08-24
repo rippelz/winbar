@@ -19,6 +19,7 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/protocols/XDGShell.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
@@ -63,8 +64,12 @@ static void hkOnUpdateState(Window* thisptr) {
         return;
 
     // Ignore unfocused minimize requests (focus-loss games).
+    // Hyprland 0.56+: active window lives on Desktop::focusState(), not CCompositor.
     const auto self = thisptr->m_self.lock();
-    if (!self || !g_pCompositor || !g_pCompositor->isWindowActive(self))
+    if (!self)
+        return;
+    auto fs = Desktop::focusState();
+    if (!fs || !fs->isWindowActive(self))
         return;
 
     // winbar-dock listens for minimized>>addr,1

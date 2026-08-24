@@ -9,22 +9,29 @@
 #     blue = focused; count badge when multiple windows
 #   - left click:  launch / focus / window picker
 #   - hover:       thumbnail preview popup, centered above icon
-#   - right click: pin / unpin / new window / close
+#   - right click: pin / unpin / new window / add to desktop / close
 #   - hold + drag icons left/right to reorder (icons shuffle
 #     live under the cursor; pinned order persists)
 #   - hides while a window is fullscreen on its monitor
+#
+# Also owns the popups that hang off the bar: alt-tab switcher,
+# task view, quick settings, tray overflow, and the Windows 11
+# style start menu (search / pinned grid / recommended / all apps
+# / power), which replaced the old rofi combi menu.
 #
 # Thumbnails: whenever a window gains focus it is snapshotted
 # with grim (scaled jpeg, atomic rename) into
 # ~/.cache/winbar/thumbs so previews show real window content.
 #
-# Pinned apps: ~/.config/winbar/pinned.json (list of .desktop ids)
+# Pinned apps:   ~/.config/winbar/pinned.json       (.desktop ids)
+# Start menu:    ~/.config/winbar/start-pinned.json (.desktop ids)
 # ============================================================
 
 import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -39,6 +46,26 @@ try:
 except Exception:
     pass
 
+# ---- AppImage env hygiene ----
+# We're often restarted from a terminal that is itself an AppImage (T3-Code
+# and friends). Those runtimes export ELECTRON_RUN_AS_NODE=1 and point
+# LD_LIBRARY_PATH/PATH at their own /tmp/.mount_* tree. Gio.AppInfo.launch()
+# hands our environment to everything we start, so that leakage silently
+# breaks any Electron app launched from the bar or start menu: it runs as a
+# bare node process and exits without ever drawing a window.
+for _var in ('ELECTRON_RUN_AS_NODE', 'APPDIR', 'APPIMAGE', 'ARGV0', 'OWD'):
+    os.environ.pop(_var, None)
+for _var in ('LD_LIBRARY_PATH', 'LD_PRELOAD', 'PATH',
+             'XDG_DATA_DIRS', 'GSETTINGS_SCHEMA_DIR'):
+    _val = os.environ.get(_var)
+    if not _val:
+        continue
+    _kept = [p for p in _val.split(':') if p and not p.startswith('/tmp/.mount_')]
+    if _kept:
+        os.environ[_var] = ':'.join(_kept)
+    else:
+        os.environ.pop(_var, None)
+
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -47,6 +74,94 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import (Gtk, Gdk, GLib, Gio, GdkPixbuf,  # noqa: E402
                            GtkLayerShell, Pango)
+
+
+# ---- theme.css hot-reload (SIGHUP / SIGUSR1 from `theme apply`) ----
+# Atomic provider swap so taskbar icons don't vanish for a frame.
+_THEME_PROVIDER = None
+_THEME_CSS = os.path.expanduser('~/.config/winbar/theme.css')
+
+WALLACCENT_CSS = os.path.expanduser('~/.config/waybar/accent.css')
+WALLACCENT_RASI = os.path.expanduser('~/.config/rofi/accent.rasi')
+
+
+def wallpaper_accent():
+    """The accent wallaccent derived from the current wallpaper, if any.
+
+    wallaccent doesn't target winbar, so we just read the files it
+    generates for waybar / rofi (both are rewritten on every wallpaper
+    change) instead of adding another consumer to it."""
+    for path, pat in ((WALLACCENT_CSS,
+                       r'@define-color\s+accent\s+(#[0-9a-fA-F]{6})'),
+                      (WALLACCENT_RASI,
+                       r'accent:\s*(#[0-9a-fA-F]{6})')):
+        try:
+            with open(path) as f:
+                m = re.search(pat, f.read())
+            if m:
+                return m.group(1)
+        except OSError:
+            continue
+    return None
+
+
+def accent_css(theme_css):
+    """Start-menu accents: wallpaper accent first, else the theme's own.
+
+    theme.css only overrides a handful of classes, so rather than teach
+    every theme snapshot about the start menu we fall back to the accent
+    it already sets on `.ind.active` (the focused-app underline)."""
+    hexcol = wallpaper_accent()
+    if not hexcol:
+        m = re.search(r'\.ind\.active\s*\{[^}]*background:\s*(#[0-9a-fA-F]{6})',
+                      theme_css or '')
+        hexcol = m.group(1) if m else '#6cb8ff'
+    r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+    return f"""
+list.stlist row:selected {{ background: rgba({r},{g},{b},0.32); }}
+button.stpower:hover {{ background: rgba({r},{g},{b},0.50); }}
+.stsearch:focus-within {{ border: 1px solid rgba({r},{g},{b},0.70); }}
+.stcat:hover {{ border: 1px solid rgba({r},{g},{b},0.45); }}
+.stuser image {{ color: rgba({r},{g},{b},1.0); }}
+"""
+
+
+def load_theme_css():
+    """Load/replace ~/.config/winbar/theme.css without restarting the dock."""
+    global _THEME_PROVIDER
+    screen = Gdk.Screen.get_default()
+    if screen is None:
+        return False
+    nxt = Gtk.CssProvider()
+    try:
+        css = ''
+        if os.path.exists(_THEME_CSS):
+            with open(_THEME_CSS) as f:
+                css = f.read()
+        nxt.load_from_data((css + accent_css(css)).encode())
+    except Exception as e:
+        print(f'winbar-dock: theme.css load failed: {e}', file=sys.stderr)
+        return False
+    # add new first, then remove old — no gap with bare styles
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, nxt, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+    if _THEME_PROVIDER is not None:
+        try:
+            Gtk.StyleContext.remove_provider_for_screen(screen, _THEME_PROVIDER)
+        except Exception:
+            pass
+    _THEME_PROVIDER = nxt
+    return True
+
+def _theme_signal(_signum, _frame):
+    # GTK is not signal-safe; bounce to main loop
+    GLib.idle_add(load_theme_css)
+
+def install_theme_signal_handlers():
+    import signal
+    signal.signal(signal.SIGHUP, _theme_signal)
+    signal.signal(signal.SIGUSR1, _theme_signal)
+
 
 MARGIN_LEFT = 205          # px, sits right after the search pill
 BAR_HEIGHT = 48
@@ -65,29 +180,83 @@ RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
 CTRL_SOCK = os.path.join(RUNTIME_DIR, 'winbar-dock.sock')
 TRAY_FILE = os.path.join(CONFIG_DIR, 'tray-apps.json')
 ART_DIR = os.path.expanduser('~/.cache/winbar/art')
+# "Add to desktop" drops a .desktop copy here; winbar-desk's folder
+# monitor picks it up and gives it the next free grid cell.
+DESKTOP_DIR = os.path.expanduser('~/Desktop')
 DEFAULT_TRAY = ['com.obsproject.Studio.desktop']
 MINIMIZED_WS = 'special:minimized'
 MINIMIZED_FILE = os.path.expanduser('~/.local/state/winmode/minimized.json')
 
-# start menu: rofi 2.0's wayland backend has no click-to-exit
-# (temp_click_to_exit is NULL there), so the dock provides the
-# click-off backdrop and spawns rofi on top of it.
-ROFI_CMD = [os.path.expanduser('~/.local/bin/rofi-apps'),
-            '-show', 'combi', '-theme',
-            os.path.expanduser('~/.config/rofi/winmode-start.rasi')]
+# start menu (Windows 11 style, drawn in-process). Replaced the rofi
+# combi menu: rofi's wayland backend can't do click-off, hover states or
+# per-entry right-click menus, and every open re-spawned rofi + an
+# app-recency sync. Layout: search pill, pinned grid, recommended
+# (recent files), all-apps list, user + folders + power footer.
+START_PINNED_FILE = os.path.join(CONFIG_DIR, 'start-pinned.json')
+START_W, START_H = 720, 930  # fixed, like the real thing: the body scrolls
+START_COLS = 8              # pinned tiles per row
+START_CAT_COLS = 4          # category tiles per row
+CAT_ICON = 32               # icon size inside a category tile
+CAT_CELL = 44               # fixed square cell so the 2x2 grid stays true
+CAT_CELL_GAP = 12
+CAT_TILE = 150              # category tile is a fixed square
+CAT_FRAME = 136             # the rounded square holding the 2x2 grid
+START_RECENT = 4            # "Recommended" entries (2 cols x 2 rows)
+START_RESULTS = 20          # max search hits
+
+# Windows 11 groups "All" into category tiles; freedesktop Categories are
+# the closest thing we have to that. First match wins, in this order.
+START_CATEGORIES = [
+    ('Utilities & Tools', ('System', 'Settings', 'Utility', 'Security',
+                           'Archiving', 'FileTools', 'Filesystem',
+                           'TerminalEmulator', 'Monitor')),
+    ('Productivity', ('Office', 'Development', 'IDE', 'TextEditor',
+                      'Spreadsheet', 'WordProcessor', 'Calendar',
+                      'ProjectManagement')),
+    ('Games', ('Game', 'ActionGame', 'AdventureGame', 'Emulator')),
+    ('Creativity', ('Graphics', 'Photography', 'RasterGraphics',
+                    'VectorGraphics', '3DGraphics', 'AudioVideoEditing',
+                    'Publishing')),
+    ('Entertainment', ('AudioVideo', 'Audio', 'Video', 'Player', 'Music',
+                       'TV', 'Recorder')),
+    ('Information & Reading', ('Education', 'Science', 'News', 'Literature',
+                               'Documentation', 'Dictionary', 'Maps')),
+    ('Social', ('Network', 'InstantMessaging', 'Chat', 'Email', 'WebBrowser',
+                'Telephony', 'VideoConference')),
+]
+RECENT_XBEL = os.path.expanduser('~/.local/share/recently-used.xbel')
+RECENT_KDE = os.path.expanduser('~/.local/share/RecentDocuments')
+# folder shortcuts in the footer, next to the power button
+START_FOLDERS = [
+    ('', 'Home', os.path.expanduser('~')),
+    ('', 'Downloads', os.path.expanduser('~/Downloads')),
+    ('', 'Documents', os.path.expanduser('~/Documents')),
+    ('', 'Pictures', os.path.expanduser('~/Pictures')),
+]
+START_POWER = [
+    ('Lock', ['loginctl', 'lock-session']),
+    ('Sleep', ['systemctl', 'suspend']),
+    ('Restart', ['systemctl', 'reboot']),
+    ('Shut down', ['systemctl', 'poweroff']),
+]
 
 # night light: click cycles the steps, right-click jumps to Off.
-# Temperature steps run hyprsunset; the last step is a Hyprland
-# screen shader that maps luminance to pure red.
+# Temperature steps run hyprsunset; the last two steps are Hyprland
+# screen shaders — luminance-to-red, then a pure red channel.
+# Shaders are applied via night-shader.conf + hyprctl reload, because
+# hyprctl keyword doesn't work with lua configs (Hyprland 0.56+).
 NIGHT_STATE = os.path.join(CONFIG_DIR, 'night-step')
 NIGHT_SHADER = os.path.join(CONFIG_DIR, 'night-red.glsl')
+NIGHT_SHADER_REDONLY = os.path.join(CONFIG_DIR, 'night-redonly.glsl')
+NIGHT_SHADER_CONF = os.path.expanduser('~/.config/hypr/night-shader.conf')
 NIGHT_STEPS = [
     ('Off', None),
-    ('4200K', 4200),
-    ('3000K', 3000),
-    ('2200K', 2200),
-    ('1200K', 1200),
+    ('Warm', 4200),
+    ('Warmer', 3000),
+    ('Toasty', 2200),
+    ('Ember', 1200),
     ('Red', 'red'),
+    ('Red only', 'redonly'),
 ]
 NIGHT_SHADER_SRC = """#version 300 es
 precision highp float;
@@ -98,6 +267,16 @@ void main() {
     vec4 c = texture(tex, v_texcoord);
     float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
     fragColor = vec4(lum, 0.0, 0.0, c.a);
+}
+"""
+NIGHT_SHADER_REDONLY_SRC = """#version 300 es
+precision highp float;
+in vec2 v_texcoord;
+out vec4 fragColor;
+uniform sampler2D tex;
+void main() {
+    vec4 c = texture(tex, v_texcoord);
+    fragColor = vec4(c.r, 0.0, 0.0, c.a);
 }
 """
 DEFAULT_PINNED = [
@@ -222,6 +401,140 @@ button.traybtn:hover { background: rgba(255,255,255,0.10); }
 /* ---- task view ---- */
 .tvbackdrop { background: rgba(0,0,0,0.35); }
 .tvheader { color: #ffffff; font-weight: bold; font-size: 13px; }
+
+/* ---- start menu (Windows 11 style) ---- */
+.startcard {
+    font-family: "Noto Sans", "Segoe UI", sans-serif;
+    /* Real acrylic: hyprland.lua carries a layer_rule blurring this
+       surface, and ignore_alpha keeps the transparent click-off backdrop
+       out of it. Alpha must stay above that threshold. */
+    background: rgba(30,30,32,0.72);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 10px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55);
+}
+.stsearch {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 20px;
+    padding: 0 14px;
+}
+entry.stentry {
+    background: transparent;
+    border: none; box-shadow: none; outline: none;
+    color: #f3f3f3;
+    caret-color: #f3f3f3;
+    font-size: 13px;
+    min-height: 36px;
+    padding: 0 6px;
+}
+entry.stentry placeholder { color: rgba(255,255,255,0.45); }
+.stglyph {
+    color: rgba(255,255,255,0.60);
+    font-family: "Commit Mono Nerd Font";
+    font-size: 12px;
+}
+.sthdr { color: #f3f3f3; font-size: 13px; font-weight: 600; }
+.stdim { color: rgba(255,255,255,0.55); font-size: 12px; }
+button.stlink {
+    color: #f3f3f3;
+    background: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 11.5px;
+    min-height: 0; min-width: 0;
+}
+button.stlink:hover {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.09);
+}
+button.sttile {
+    background: transparent;
+    border: none; box-shadow: none;
+    border-radius: 6px;
+    padding: 10px 2px 8px 2px;
+    min-width: 0; min-height: 0;
+}
+button.sttile:hover { background: rgba(255,255,255,0.07); }
+.sttile label { color: #f3f3f3; font-size: 11px; }
+/* category tiles in the "All" grid */
+button.stcatbtn {
+    background: transparent;
+    border: none; box-shadow: none;
+    border-radius: 8px;
+    padding: 0;
+    min-width: 0; min-height: 0;
+}
+.stcat {
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    padding: 18px;
+}
+button.stcatbtn:hover .stcat { background: rgba(255,255,255,0.10); }
+.stcatlabel { color: #f3f3f3; font-size: 11.5px; }
+list.stlist { background: transparent; }
+list.stlist row {
+    background: transparent;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+list.stlist row:hover { background: rgba(255,255,255,0.07); }
+.strow label { color: #f3f3f3; font-size: 12.5px; }
+.strowsub { color: rgba(255,255,255,0.50); font-size: 11px; }
+button.stcard {
+    background: transparent;
+    border: none; box-shadow: none;
+    border-radius: 6px;
+    padding: 6px 8px;
+    min-width: 0; min-height: 0;
+}
+button.stcard:hover { background: rgba(255,255,255,0.07); }
+/* footer band, slightly lifted like the real one */
+.stfooter {
+    background: rgba(255,255,255,0.04);
+    border-top: 1px solid rgba(255,255,255,0.07);
+}
+.stuser { color: #f3f3f3; font-size: 12.5px; }
+button.stfoot, button.stpower {
+    background: transparent;
+    border: none; box-shadow: none;
+    border-radius: 4px;
+    padding: 7px 10px;
+    font-family: "Commit Mono Nerd Font";
+    font-size: 14px;
+    color: rgba(255,255,255,0.85);
+    min-width: 0; min-height: 0;
+}
+button.stfoot:hover, button.stpower:hover {
+    background: rgba(255,255,255,0.10);
+    color: #ffffff;
+}
+/* everything that reacts to the pointer eases instead of snapping */
+button.sttile, button.stcatbtn, .stcat, button.stlink, button.stcard,
+button.stfoot, button.stpower, .stsearch, list.stlist row, .stuser image {
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1),
+                border-color 160ms cubic-bezier(0.2,0,0,1),
+                color 160ms cubic-bezier(0.2,0,0,1),
+                box-shadow 160ms cubic-bezier(0.2,0,0,1);
+}
+button.sttile:active, button.stcatbtn:active .stcat, button.stcard:active {
+    background: rgba(255,255,255,0.03);
+}
+scrolledwindow.stscroll undershoot,
+scrolledwindow.stscroll overshoot { background: none; }
+scrolledwindow.stscroll scrollbar { background: transparent; border: none; }
+scrolledwindow.stscroll scrollbar slider {
+    background: rgba(255,255,255,0.22);
+    border: none;
+    min-width: 6px;
+    border-radius: 3px;
+}
+scrolledwindow.stscroll scrollbar slider:hover {
+    background: rgba(255,255,255,0.35);
+}
 """
 
 
@@ -234,8 +547,127 @@ def hyprctl(*args, want_json=False):
         return [] if want_json else ''
 
 
+def _lua_str(s):
+    """Quote a string for embedding in a hyprctl Lua dispatch expression."""
+    return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
 def dispatch(*args):
-    hyprctl('dispatch', *args)
+    """Send a dispatcher. Accepts legacy names (focuswindow, …) or raw Lua
+    (hl.dsp.…). Legacy forms are translated for Hyprland 0.56+ Lua configs,
+    where `hyprctl dispatch focuswindow …` is no longer valid syntax.
+    """
+    if not args:
+        return
+    first = str(args[0])
+    if first.startswith('hl.') or first.startswith('return '):
+        hyprctl('dispatch', first if len(args) == 1 else ' '.join(str(a) for a in args))
+        return
+
+    cmd = first
+    arg = args[1] if len(args) > 1 else ''
+    if len(args) > 2:
+        arg = ','.join(str(a) for a in args[1:])
+    arg = str(arg).strip()
+
+    def win_sel(s):
+        s = s.strip()
+        if not s:
+            return None
+        # "address:0x…", "class:foo", or bare address
+        if s.startswith('address:') or s.startswith('class:') or s.startswith('title:'):
+            return s
+        if s.startswith('0x') or s.startswith('0X'):
+            return f'address:{s}'
+        return s
+
+    lua = None
+    if cmd == 'focuswindow':
+        w = win_sel(arg)
+        if w:
+            lua = f'hl.dsp.focus({{window = {_lua_str(w)}}})'
+    elif cmd == 'closewindow':
+        w = win_sel(arg)
+        if w:
+            lua = f'hl.dsp.window.close({{window = {_lua_str(w)}}})'
+        else:
+            lua = 'hl.dsp.window.close()'
+    elif cmd in ('movetoworkspacesilent', 'movetoworkspace'):
+        # "WS,address:0x…" or "WS,class:…"
+        parts = [p.strip() for p in arg.split(',', 1)]
+        ws = parts[0] if parts else ''
+        w = win_sel(parts[1]) if len(parts) > 1 else None
+        silent = cmd.endswith('silent')
+        # numeric workspaces as numbers, special: names as strings
+        try:
+            ws_lit = str(int(ws))
+        except (TypeError, ValueError):
+            ws_lit = _lua_str(ws)
+        bits = [f'workspace = {ws_lit}']
+        if w:
+            bits.append(f'window = {_lua_str(w)}')
+        if silent:
+            bits.append('silent = true')
+        lua = f'hl.dsp.window.move({{{", ".join(bits)}}})'
+    elif cmd == 'workspace':
+        try:
+            lua = f'hl.dsp.focus({{workspace = {int(arg)}}})'
+        except (TypeError, ValueError):
+            lua = f'hl.dsp.focus({{workspace = {_lua_str(arg)}}})'
+    elif cmd == 'alterzorder':
+        # "top,address:0x…"
+        parts = [p.strip() for p in arg.split(',', 1)]
+        mode = parts[0] if parts else 'top'
+        w = win_sel(parts[1]) if len(parts) > 1 else None
+        if w:
+            lua = f'hl.dsp.window.bring_to_top({{window = {_lua_str(w)}}})'
+        else:
+            lua = 'hl.dsp.window.bring_to_top()'
+    elif cmd == 'setfloating':
+        w = win_sel(arg.replace('address:', '') if arg.startswith('address:') else arg)
+        # arg is often "address:0x…"
+        w = win_sel(arg)
+        if w:
+            lua = f'hl.dsp.window.float({{action = "set", window = {_lua_str(w)}}})'
+    elif cmd == 'settiled':
+        w = win_sel(arg)
+        if w:
+            lua = f'hl.dsp.window.float({{action = "unset", window = {_lua_str(w)}}})'
+    elif cmd == 'fullscreen':
+        # "1,address:0x…" or "0,address:…"
+        parts = [p.strip() for p in arg.split(',', 1)]
+        mode = parts[0] if parts else '0'
+        w = win_sel(parts[1]) if len(parts) > 1 else None
+        action = 'set' if mode not in ('0', 'toggle') else ('toggle' if mode == 'toggle' else 'unset')
+        bits = [f'action = {_lua_str(action)}']
+        if w:
+            bits.append(f'window = {_lua_str(w)}')
+        lua = f'hl.dsp.window.fullscreen({{{", ".join(bits)}}})'
+    elif cmd == 'fullscreenstate':
+        # "0 0,address:0x…"
+        left, _, right = arg.partition(',')
+        nums = left.split()
+        internal = int(nums[0]) if nums else 0
+        client = int(nums[1]) if len(nums) > 1 else 0
+        w = win_sel(right) if right else None
+        bits = [f'internal = {internal}', f'client = {client}', 'action = "set"']
+        if w:
+            bits.append(f'window = {_lua_str(w)}')
+        lua = f'hl.dsp.window.fullscreen_state({{{", ".join(bits)}}})'
+    elif cmd == 'killactive':
+        lua = 'hl.dsp.window.close()'
+    elif cmd == 'cyclenext':
+        # prev as optional arg
+        if arg == 'prev':
+            lua = 'hl.dsp.window.cycle_next({prev = true})'
+        else:
+            lua = 'hl.dsp.window.cycle_next()'
+
+    if lua:
+        hyprctl('dispatch', lua)
+    else:
+        # last resort: join as legacy (may fail on Lua-only configs)
+        hyprctl('dispatch', *args)
 
 
 def desktop_info(desktop_id):
@@ -244,6 +676,173 @@ def desktop_info(desktop_id):
         return Gio.DesktopAppInfo.new(desktop_id)
     except TypeError:
         return None
+
+
+def all_apps():
+    """Every launchable app, sorted by display name."""
+    apps = [a for a in Gio.AppInfo.get_all()
+            if a.should_show() and a.get_display_name()]
+    apps.sort(key=lambda a: a.get_display_name().lower())
+    return apps
+
+
+_ICON_OK = {}
+
+
+def has_real_icon(app):
+    """True if the app's icon actually resolves in the icon theme.
+
+    Category previews look broken when a third of the tiles are the
+    generic "missing image" glyph, so those apps get sorted to the back."""
+    key = app.get_id() or app.get_display_name() or ''
+    if key in _ICON_OK:
+        return _ICON_OK[key]
+    icon = app.get_icon()
+    ok = False
+    try:
+        if isinstance(icon, Gio.ThemedIcon):
+            theme = Gtk.IconTheme.get_default()
+            ok = any(theme.has_icon(n) for n in icon.get_names())
+        elif isinstance(icon, Gio.FileIcon):
+            ok = os.path.exists(icon.get_file().get_path() or '')
+        else:
+            ok = icon is not None
+    except Exception:
+        ok = False
+    _ICON_OK[key] = ok
+    return ok
+
+
+def recency_table():
+    """{desktop-id: last-used epoch} from the app-recency daemon."""
+    try:
+        with open(os.path.expanduser(
+                '~/.local/state/app-recency.json')) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for k, v in (data.items() if isinstance(data, dict) else []):
+        if isinstance(v, dict):
+            v = v.get('last') or v.get('ts') or 0
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def match_score(app, needle, recency):
+    """Rank a search hit: prefix > word start > substring, then recency."""
+    name = (app.get_display_name() or '').lower()
+    if name.startswith(needle):
+        base = 0
+    elif any(w.startswith(needle) for w in name.split()):
+        base = 1
+    elif needle in name:
+        base = 2
+    elif needle in (app.get_executable() or '').lower():
+        base = 3
+    else:
+        return None
+    return (base, -recency.get(app.get_id() or '', 0), name)
+
+
+def recent_files(limit):
+    """Recently-opened files/folders, newest first.
+
+    Reads GTK's recently-used.xbel and KDE's RecentDocuments — same two
+    sources the old rofi `recent` script mode used."""
+    import datetime
+    import glob
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    items = {}
+    if os.path.exists(RECENT_XBEL):
+        try:
+            for b in ET.parse(RECENT_XBEL).getroot().findall('bookmark'):
+                href = b.get('href', '')
+                if not href.startswith('file://'):
+                    continue
+                path = urllib.parse.unquote(href[7:])
+                if os.path.exists(path):
+                    items[path] = max(items.get(path, ''), b.get('modified', ''))
+        except Exception:
+            pass
+
+    for d in glob.glob(os.path.join(RECENT_KDE, '*.desktop')):
+        try:
+            target = None
+            for line in open(d, errors='ignore'):
+                if line.startswith('URL') and '=' in line:
+                    url = line.split('=', 1)[1].strip()
+                    url = url.replace('$HOME', os.path.expanduser('~'))
+                    if url.startswith('file://'):
+                        url = urllib.parse.unquote(url[7:])
+                    target = url
+                    break
+            if target and os.path.exists(target):
+                m = datetime.datetime.fromtimestamp(
+                    os.path.getmtime(d)).isoformat()
+                items[target] = max(items.get(target, ''), m)
+        except Exception:
+            continue
+
+    ordered = sorted(items.items(), key=lambda kv: kv[1], reverse=True)
+    return [p for p, _ in ordered[:limit]]
+
+
+def file_gicon(path):
+    try:
+        return Gio.File.new_for_path(path).query_info(
+            'standard::icon', Gio.FileQueryInfoFlags.NONE, None).get_icon()
+    except Exception:
+        return Gio.ThemedIcon.new('text-x-generic')
+
+
+def pretty_path(path):
+    home = os.path.expanduser('~')
+    d = os.path.dirname(path) or '/'
+    return d.replace(home, '~', 1) if d.startswith(home) else d
+
+
+def desktop_shortcut_path(info):
+    """Where this app's shortcut would live on the desktop (or None)."""
+    src = info.get_filename() if info else None
+    if not src:
+        return None
+    return os.path.join(DESKTOP_DIR, os.path.basename(src))
+
+
+def add_to_desktop(info):
+    """Copy an app's .desktop onto ~/Desktop as a launcher shortcut."""
+    src = info.get_filename() if info else None
+    dest = desktop_shortcut_path(info)
+    if not dest:
+        return False
+    try:
+        os.makedirs(DESKTOP_DIR, exist_ok=True)
+        shutil.copyfile(src, dest)
+        os.chmod(dest, 0o755)      # file managers only trust +x launchers
+        return True
+    except OSError as e:
+        print(f'winbar-dock: add to desktop failed: {e}', file=sys.stderr)
+        return False
+
+
+def link_to_desktop(path):
+    """Put a file/folder on the desktop as a symlink (no copy: recents
+    can be multi-GB videos)."""
+    dest = os.path.join(DESKTOP_DIR, os.path.basename(path.rstrip('/')))
+    try:
+        os.makedirs(DESKTOP_DIR, exist_ok=True)
+        if not os.path.lexists(dest):
+            os.symlink(path, dest)
+        return True
+    except OSError as e:
+        print(f'winbar-dock: link to desktop failed: {e}', file=sys.stderr)
+        return False
 
 
 def thumb_path(addr):
@@ -352,9 +951,10 @@ class Dock(Gtk.Window):
         self.art_cache = {}       # url -> pixbuf
         self.night_step = self._night_load()
 
-        # start menu (rofi + click-off backdrop)
+        # start menu (in-process, click-off backdrop)
         self.start_win = None
-        self.start_timer = None
+        self.start_pinned = []
+        self.st = {}            # transient start-menu widget refs
 
         # task view overlay
         self.tv_win = None
@@ -419,16 +1019,8 @@ class Dock(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        # per-theme color overrides, swapped by `theme apply`
-        theme_css = os.path.expanduser('~/.config/winbar/theme.css')
-        if os.path.exists(theme_css):
-            try:
-                tp = Gtk.CssProvider()
-                tp.load_from_path(theme_css)
-                Gtk.StyleContext.add_provider_for_screen(
-                    screen, tp, Gtk.STYLE_PROVIDER_PRIORITY_USER)
-            except Exception:
-                pass
+        # per-theme color overrides — hot-swapped on SIGHUP (no process kill)
+        load_theme_css()
 
         self.box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.box.set_size_request(-1, BAR_HEIGHT)
@@ -879,7 +1471,13 @@ class Dock(Gtk.Window):
         g = btn._group
         if event.button == 1:
             self.tray_close()
-            if g['windows']:
+            # Anki lives on special:anki — open it on the *current* workspace
+            # (same as rofi / Super+A show) instead of just focusing the pad.
+            if g.get('id') == 'anki.desktop':
+                subprocess.Popen(
+                    [os.path.expanduser('~/.local/bin/anki-toggle'), 'show'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif g['windows']:
                 self.focus(g['windows'][0]['address'])
             return True
         if event.button == 3:
@@ -902,41 +1500,682 @@ class Dock(Gtk.Window):
             return True
         return False
 
-    # ---------- start menu (rofi) with click-off backdrop ----------
+    # ---------- start menu (Windows 11 style, in-process) ----------
+    def load_start_pinned(self):
+        """Start-menu pins. Seeded from the taskbar pins on first run."""
+        try:
+            with open(START_PINNED_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except (OSError, ValueError):
+            pass
+        seed = list(self.pinned)
+        for app_id in DEFAULT_PINNED:
+            if app_id not in seed and desktop_info(app_id):
+                seed.append(app_id)
+        return seed
+
+    def save_start_pinned(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = START_PINNED_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(self.start_pinned, f, indent=2)
+        os.replace(tmp, START_PINNED_FILE)
+
+    def start_pin(self, app_id, on=True):
+        if on and app_id not in self.start_pinned:
+            self.start_pinned.append(app_id)
+        elif not on and app_id in self.start_pinned:
+            self.start_pinned.remove(app_id)
+        else:
+            return
+        self.save_start_pinned()
+        if self.start_win:
+            self.st_show_home()
+
     def start_close(self):
-        if self.start_timer:
-            GLib.source_remove(self.start_timer)
-            self.start_timer = None
-        subprocess.run(['pkill', '-x', 'rofi'], capture_output=True)
         if self.start_win:
             self.start_win.destroy()
             self.start_win = None
+        self.st = {}
 
     def start_toggle(self):
-        if self.start_win or subprocess.run(
-                ['pgrep', '-x', 'rofi'],
-                capture_output=True).returncode == 0:
+        if self.start_win:
             self.start_close()
             return
-        # Backdrop on the TOP layer, rofi (overlay layer) maps above it:
-        # clicks beside the menu land on the backdrop and close both.
-        w = self._backdrop('winbar-start', self.start_close,
-                           layer=GtkLayerShell.Layer.TOP)
+        self.st = {}
+        self.start_pinned = self.load_start_pinned()
+        w = self._backdrop('winbar-start', self.start_close)
+        # EXCLUSIVE (not ON_DEMAND): the menu opens from a taskbar click,
+        # so it has to take the keyboard itself or search can't be typed.
+        if hasattr(GtkLayerShell, 'set_keyboard_mode'):
+            GtkLayerShell.set_keyboard_mode(
+                w, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.get_style_context().add_class('startcard')
+        card.set_halign(Gtk.Align.START)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_start(10)
+        card.set_margin_bottom(BAR_HEIGHT + 8)
+        # fixed size, like the real thing: the body scrolls instead of the
+        # menu resizing itself as you type
+        card.set_size_request(START_W, START_H)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        for m in ('top', 'start', 'end'):
+            getattr(body, f'set_margin_{m}')(24)
+        body.set_margin_bottom(10)
+        body.pack_start(self.st_search_bar(), False, False, 0)
+
+        content = Gtk.Stack()
+        content.set_transition_duration(200)
+        content.set_homogeneous(True)
+        self.st['content'] = content
+        body.pack_start(content, True, True, 0)
+
+        card.pack_start(body, True, True, 0)
+        card.pack_start(self.st_footer(), False, False, 0)
+
+        w.add(self._swallow_clicks(card))
         gm = self._cursor_gdk_mon()
         if gm:
             GtkLayerShell.set_monitor(w, gm)
         self.start_win = w
+        self.st_show_home()
         w.show_all()
-        subprocess.Popen(ROFI_CMD)
-        self.start_timer = GLib.timeout_add(300, self._start_watch)
+        self.st['entry'].grab_focus()
 
-    def _start_watch(self):
-        # rofi went away on its own (app launched / Esc): drop backdrop
-        if subprocess.run(['pgrep', '-x', 'rofi'],
-                          capture_output=True).returncode != 0:
-            self.start_timer = None
-            self.start_close()
+    # ----- chrome -----
+    def st_search_bar(self):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.get_style_context().add_class('stsearch')
+        glyph = Gtk.Label(label='')
+        glyph.get_style_context().add_class('stglyph')
+        row.pack_start(glyph, False, False, 0)
+
+        entry = Gtk.Entry()
+        entry.get_style_context().add_class('stentry')
+        entry.set_has_frame(False)
+        entry.set_placeholder_text(
+            'Search for apps, settings, and documents')
+        entry.connect('changed', lambda _e: self.st_on_search())
+        entry.connect('activate', lambda _e: self.st_activate_selected())
+        entry.connect('key-press-event', self.st_on_entry_key)
+        self.st['entry'] = entry
+        row.pack_start(entry, True, True, 0)
+        return row
+
+    def st_footer(self):
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        foot.get_style_context().add_class('stfooter')
+        for m in ('start', 'end'):
+            getattr(foot, f'set_margin_{m}')(20)
+        for m in ('top', 'bottom'):
+            getattr(foot, f'set_margin_{m}')(12)
+
+        user = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        avatar = Gtk.Image.new_from_gicon(
+            Gio.ThemedIcon.new('avatar-default'), Gtk.IconSize.INVALID)
+        avatar.set_pixel_size(26)
+        user.pack_start(avatar, False, False, 0)
+        name = Gtk.Label(label=os.environ.get('USER', 'user'))
+        name.get_style_context().add_class('stuser')
+        user.pack_start(name, False, False, 0)
+        foot.pack_start(user, False, False, 0)
+
+        power = Gtk.Button(label='')
+        power.get_style_context().add_class('stpower')
+        power.set_relief(Gtk.ReliefStyle.NONE)
+        power.set_tooltip_text('Power')
+        power.connect('clicked', self.st_power_menu)
+        foot.pack_end(power, False, False, 0)
+
+        # pack_end in reverse so they read left-to-right before Power
+        for glyph, label, path in reversed(START_FOLDERS):
+            if not os.path.isdir(path):
+                continue
+            b = Gtk.Button(label=glyph)
+            b.get_style_context().add_class('stfoot')
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.set_tooltip_text(label)
+            b.connect('clicked', lambda _b, p=path: self.st_open_path(p))
+            foot.pack_end(b, False, False, 0)
+        return foot
+
+    def st_power_menu(self, btn):
+        menu = Gtk.Menu()
+        for label, cmd in START_POWER:
+            mi = Gtk.MenuItem(label=label)
+            mi.connect('activate', lambda _m, c=cmd: self.st_power(c))
+            menu.append(mi)
+        mi = Gtk.MenuItem(label='Log out')
+        mi.connect('activate', lambda _m: self.st_logout())
+        menu.append(mi)
+        menu.show_all()
+        menu.popup_at_widget(btn, Gdk.Gravity.NORTH_EAST,
+                             Gdk.Gravity.SOUTH_EAST, None)
+
+    def st_power(self, cmd):
+        self.start_close()
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+    def st_logout(self):
+        self.start_close()
+        sid = os.environ.get('XDG_SESSION_ID')
+        cmd = ['loginctl', 'terminate-session'] + ([sid] if sid else [])
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+    # ----- data (cached for the lifetime of one menu open) -----
+    def st_apps(self):
+        if 'apps' not in self.st:
+            self.st['apps'] = all_apps()
+        return self.st['apps']
+
+    def st_recency(self):
+        if 'recency' not in self.st:
+            self.st['recency'] = recency_table()
+        return self.st['recency']
+
+    # ----- views -----
+    def st_set_content(self, widget, motion='fade'):
+        """Swap the visible view, animating in the given direction.
+
+        Deeper (Pinned -> a category) slides left, Back slides right, and
+        search results cross-fade in place."""
+        stack = self.st.get('content')
+        if stack is None:
+            return
+        T = Gtk.StackTransitionType
+        first = not stack.get_children()
+        stack.set_transition_type(
+            T.NONE if first else
+            {'left': T.SLIDE_LEFT, 'right': T.SLIDE_RIGHT}.get(
+                motion, T.CROSSFADE))
+
+        self.st['vn'] = self.st.get('vn', 0) + 1
+        name = f'view{self.st["vn"]}'
+        stack.add_named(widget, name)
+        widget.show_all()
+        stack.set_visible_child_name(name)
+        # drop the outgoing view once it has finished sliding out
+        GLib.timeout_add(stack.get_transition_duration() + 80,
+                         self.st_prune_views)
+
+    def st_prune_views(self):
+        """Keep whatever is on screen *now*, not whatever was current when
+        this was scheduled: typing queues several of these, and a stale
+        name would prune the view the user is actually looking at."""
+        stack = self.st.get('content')
+        if stack is not None:
+            current = stack.get_visible_child()
+            for child in stack.get_children():
+                if child is not current:
+                    stack.remove(child)
+        return False
+
+    def st_header(self, text, link=None, on_link=None):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        lbl = Gtk.Label(label=text)
+        lbl.get_style_context().add_class('sthdr')
+        lbl.set_halign(Gtk.Align.START)
+        row.pack_start(lbl, True, True, 0)
+        if link:
+            b = Gtk.Button(label=link)
+            b.get_style_context().add_class('stlink')
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.connect('clicked', lambda _b: on_link())
+            row.pack_end(b, False, False, 0)
+        return row
+
+    def st_new_view(self):
+        """Forget the previous view's widgets before building the next.
+
+        These have to be cleared here rather than in st_set_content: the
+        view is fully built (and has already stashed its list/scroller)
+        by the time it is handed over, so clearing there dropped exactly
+        the refs Enter and the arrow keys need."""
+        self.st.pop('list', None)
+        self.st.pop('scroll', None)
+
+    def st_show_home(self):
+        """Pinned grid + the All-apps category grid, in one scrolling body
+        (Recommended sits below the fold, like Win11 with it turned off)."""
+        self.st_new_view()
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22)
+
+        body.pack_start(
+            self.st_header('Pinned', 'Show all  \uf078', self.st_show_all_apps),
+            False, False, 0)
+        grid = Gtk.FlowBox()
+        grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        grid.set_max_children_per_line(START_COLS)
+        grid.set_min_children_per_line(START_COLS)
+        grid.set_homogeneous(True)
+        grid.set_row_spacing(6)
+        for app_id in self.start_pinned:
+            info = desktop_info(app_id)
+            if info:
+                grid.add(self.st_tile(info))
+        body.pack_start(grid, False, False, 0)
+
+        view = self.st.get('allview', 'category')
+        body.pack_start(
+            self.st_header(
+                'All',
+                'View: %s  \uf078' % ('Category' if view == 'category'
+                                       else 'Name'),
+                self.st_toggle_allview),
+            False, False, 0)
+        if view == 'category':
+            cats = Gtk.FlowBox()
+            cats.set_selection_mode(Gtk.SelectionMode.NONE)
+            cats.set_max_children_per_line(START_CAT_COLS)
+            cats.set_min_children_per_line(START_CAT_COLS)
+            cats.set_homogeneous(True)
+            cats.set_row_spacing(10)
+            cats.set_column_spacing(10)
+            for name, apps in self.st_categories():
+                cats.add(self.st_category_tile(name, apps))
+            body.pack_start(cats, False, False, 0)
+        else:
+            lb = self.st_listbox()
+            for app in self.st_apps():
+                lb.add(self.st_app_row(app))
+            body.pack_start(lb, False, False, 0)
+
+        files = recent_files(START_RECENT)
+        if files:
+            body.pack_start(self.st_header('Recommended'), False, False, 0)
+            rec = Gtk.FlowBox()
+            rec.set_selection_mode(Gtk.SelectionMode.NONE)
+            rec.set_max_children_per_line(2)
+            rec.set_min_children_per_line(2)
+            rec.set_homogeneous(True)
+            rec.set_column_spacing(4)
+            for path in files:
+                rec.add(self.st_file_card(path))
+            body.pack_start(rec, False, False, 0)
+
+        self.st_set_content(self.st_scroller(body),
+                            self.st.pop('motion', 'fade'))
+
+    def st_toggle_allview(self):
+        self.st['allview'] = ('name' if self.st.get('allview', 'category')
+                              == 'category' else 'category')
+        self.st['motion'] = 'fade'
+        self.st_show_home()
+
+    def st_back_home(self):
+        self.st['motion'] = 'right'
+        self.st_show_home()
+
+    def st_categories(self):
+        """[(category, [app, ...])] in START_CATEGORIES order, non-empty."""
+        if 'cats' in self.st:
+            return self.st['cats']
+        buckets = {name: [] for name, _ in START_CATEGORIES}
+        buckets['Other'] = []
+        for app in self.st_apps():
+            cats = set((app.get_categories() or '').split(';'))
+            for name, keys in START_CATEGORIES:
+                if cats.intersection(keys):
+                    buckets[name].append(app)
+                    break
+            else:
+                buckets['Other'].append(app)
+        out = [(n, buckets[n]) for n, _ in START_CATEGORIES if buckets[n]]
+        if buckets['Other']:
+            out.append(('Other', buckets['Other']))
+        self.st['cats'] = out
+        return out
+
+    def st_show_category(self, name, apps):
+        self.st_new_view()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.pack_start(self.st_header(name, '\uf053  Back', self.st_back_home),
+                       False, False, 0)
+        lb = self.st_listbox()
+        for app in apps:
+            lb.add(self.st_app_row(app))
+        box.pack_start(lb, False, False, 0)
+        self.st_set_content(self.st_scroller(box), 'left')
+
+    def st_show_all_apps(self):
+        self.st_new_view()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.pack_start(
+            self.st_header('All apps', '\uf053  Back', self.st_back_home),
+            False, False, 0)
+        lb = self.st_listbox()
+        for app in self.st_apps():
+            lb.add(self.st_app_row(app))
+        box.pack_start(lb, False, False, 0)
+        self.st_set_content(self.st_scroller(box), 'left')
+
+    def st_scroller(self, child):
+        scroll = Gtk.ScrolledWindow()
+        scroll.get_style_context().add_class('stscroll')
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(child)
+        self.st['scroll'] = scroll
+        return scroll
+
+    def st_on_search(self):
+        self.st_new_view()
+        text = self.st['entry'].get_text().strip().lower()
+        if not text:
+            self.st_show_home()
+            return
+        recency = self.st_recency()
+        hits = []
+        for app in self.st_apps():
+            score = match_score(app, text, recency)
+            if score is not None:
+                hits.append((score, app))
+        hits.sort(key=lambda h: h[0])
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.pack_start(self.st_header('Best match' if hits else 'No results'),
+                       False, False, 0)
+        lb = self.st_listbox(selectable=True)
+        for _score, app in hits[:START_RESULTS]:
+            lb.add(self.st_app_row(app))
+        box.pack_start(lb, False, False, 0)
+        self.st['list'] = lb
+        self.st_set_content(self.st_scroller(box), 'fade')
+        first = lb.get_row_at_index(0)
+        if first:
+            lb.select_row(first)
+
+    # ----- rows and tiles -----
+    def st_category_tile(self, name, apps):
+        """A rounded tile holding a 2x2 preview of the category's apps."""
+        b = Gtk.Button()
+        b.get_style_context().add_class('stcatbtn')
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        square = Gtk.Grid()
+        square.set_row_spacing(CAT_CELL_GAP)
+        square.set_column_spacing(CAT_CELL_GAP)
+        square.set_row_homogeneous(True)
+        square.set_column_homogeneous(True)
+        square.set_halign(Gtk.Align.CENTER)
+        square.set_valign(Gtk.Align.CENTER)
+        recency = self.st_recency()
+        # most-recently-used first, but never lead with a broken icon
+        ordered = sorted(apps, key=lambda a: (not has_real_icon(a),
+                                              -recency.get(a.get_id() or '', 0),
+                                              (a.get_display_name() or '').lower()))
+        # one tile showing the same icon four times looks like a bug
+        top, seen = [], set()
+        for app in ordered:
+            if not has_real_icon(app):
+                continue
+            icon = app.get_icon()
+            key = (icon.to_string() if icon else None) or app.get_id()
+            if key in seen:
+                continue
+            seen.add(key)
+            top.append(app)
+            if len(top) == 4:
+                break
+        if not top:
+            top = ordered[:4]
+        # Every cell is the same square regardless of the icon's aspect
+        # ratio, or a tall/round icon shoves the others out of alignment.
+        # Sparse categories centre what they have instead of hugging the
+        # top-left corner.
+        spans = {1: [(0, 0, 2, 2)],
+                 2: [(0, 0, 1, 2), (1, 0, 1, 2)],
+                 3: [(0, 0, 1, 1), (1, 0, 1, 1), (0, 1, 2, 1)]}.get(
+                     len(top), [(i % 2, i // 2, 1, 1) for i in range(4)])
+        for app, (col, row, cw, ch) in zip(top, spans):
+            cell = Gtk.Box()
+            cell.set_size_request(CAT_CELL, CAT_CELL)
+            cell.set_halign(Gtk.Align.CENTER)
+            cell.set_valign(Gtk.Align.CENTER)
+            img = Gtk.Image.new_from_gicon(
+                app.get_icon()
+                or Gio.ThemedIcon.new('application-x-executable'),
+                Gtk.IconSize.INVALID)
+            img.set_pixel_size(CAT_ICON)
+            img.set_halign(Gtk.Align.CENTER)
+            img.set_valign(Gtk.Align.CENTER)
+            cell.pack_start(img, True, True, 0)
+            square.attach(cell, col, row, cw, ch)
+        # the frame is a fixed square so a category with one app is the
+        # same size as one with four
+        frame = Gtk.Box()
+        frame.get_style_context().add_class('stcat')
+        frame.set_size_request(CAT_FRAME, CAT_FRAME)
+        frame.set_halign(Gtk.Align.CENTER)
+        frame.pack_start(square, True, True, 0)
+        v.pack_start(frame, False, False, 0)
+
+        lbl = Gtk.Label(label=name)
+        lbl.get_style_context().add_class('stcatlabel')
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(18)
+        v.pack_start(lbl, False, False, 0)
+
+        b.add(v)
+        b.set_size_request(CAT_TILE, -1)
+        b.set_tooltip_text(f'{name} ({len(apps)} apps)')
+        b.connect('clicked', lambda _b: self.st_show_category(name, apps))
+        return b
+
+    def st_tile(self, info):
+        b = Gtk.Button()
+        b.get_style_context().add_class('sttile')
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        img = Gtk.Image.new_from_gicon(info.get_icon()
+                                       or Gio.ThemedIcon.new(
+                                           'application-x-executable'),
+                                       Gtk.IconSize.INVALID)
+        img.set_pixel_size(32)
+        v.pack_start(img, False, False, 0)
+        lbl = Gtk.Label(label=info.get_display_name())
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_line_wrap(True)
+        lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lbl.set_lines(2)          # "Microsoft 365 Copilot" wraps, not clips
+        lbl.set_justify(Gtk.Justification.CENTER)
+        lbl.set_max_width_chars(10)
+        lbl.set_width_chars(10)
+        v.pack_start(lbl, False, False, 0)
+        b.add(v)
+        b.set_tooltip_text(info.get_display_name())
+        b.connect('clicked', lambda _b: self.st_launch(info))
+        b.connect('button-press-event',
+                  lambda _b, ev: (self.st_app_press(ev, info)
+                                  if ev.button == 3 else False))
+        return b
+
+    def st_listbox(self, selectable=False):
+        """A menu list. Row press/activate is handled here rather than on
+        the rows: a ListBoxRow has no event window of its own."""
+        lb = Gtk.ListBox()
+        lb.get_style_context().add_class('stlist')
+        lb.set_selection_mode(Gtk.SelectionMode.BROWSE if selectable
+                              else Gtk.SelectionMode.NONE)
+        lb.connect('row-activated', lambda _lb, row: self.st_row_activate(row))
+        lb.connect('button-press-event', self.st_list_press)
+        return lb
+
+    def st_list_press(self, lb, event):
+        if event.button != 3:
             return False
+        row = lb.get_row_at_y(int(event.y))
+        if row is None:
+            return False
+        if getattr(row, '_app', None):
+            return self.st_app_press(event, row._app)
+        if getattr(row, '_path', None):
+            return self.st_file_press(event, row._path)
+        return False
+
+    def st_app_row(self, info):
+        row = Gtk.ListBoxRow()
+        row._app = info
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.get_style_context().add_class('strow')
+        img = Gtk.Image.new_from_gicon(info.get_icon()
+                                       or Gio.ThemedIcon.new(
+                                           'application-x-executable'),
+                                       Gtk.IconSize.INVALID)
+        img.set_pixel_size(24)
+        box.pack_start(img, False, False, 0)
+        lbl = Gtk.Label(label=info.get_display_name())
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        box.pack_start(lbl, True, True, 0)
+        row.add(box)
+        return row
+
+    def st_file_card(self, path):
+        b = Gtk.Button()
+        b.get_style_context().add_class('stcard')
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.get_style_context().add_class('strow')
+        img = Gtk.Image.new_from_gicon(file_gicon(path), Gtk.IconSize.INVALID)
+        img.set_pixel_size(30)
+        box.pack_start(img, False, False, 0)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        v.set_valign(Gtk.Align.CENTER)
+        lbl = Gtk.Label(label=os.path.basename(path.rstrip('/')) or path)
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_max_width_chars(24)
+        v.pack_start(lbl, False, False, 0)
+        sub = Gtk.Label(label=pretty_path(path))
+        sub.get_style_context().add_class('strowsub')
+        sub.set_halign(Gtk.Align.START)
+        sub.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        sub.set_max_width_chars(24)
+        v.pack_start(sub, False, False, 0)
+        box.pack_start(v, True, True, 0)
+        b.add(box)
+        b.set_tooltip_text(path)
+        b.connect('clicked', lambda _b: self.st_open_path(path))
+        b.connect('button-press-event',
+                  lambda _b, ev: (self.st_file_press(ev, path)
+                                  if ev.button == 3 else False))
+        return b
+
+    # ----- actions -----
+    def st_launch(self, info):
+        self.start_close()
+        self.launch({'info': info, 'id': info.get_id()})
+
+    def st_open_path(self, path):
+        self.start_close()
+        try:
+            Gio.AppInfo.launch_default_for_uri(
+                Gio.File.new_for_path(path).get_uri(), None)
+        except Exception as e:
+            print(f'winbar-dock: open {path} failed: {e}', file=sys.stderr)
+
+    def st_row_activate(self, row):
+        if row is None:
+            return
+        if getattr(row, '_app', None):
+            self.st_launch(row._app)
+        elif getattr(row, '_path', None):
+            self.st_open_path(row._path)
+
+    def st_activate_selected(self):
+        lb = self.st.get('list')
+        if lb is not None:
+            self.st_row_activate(lb.get_selected_row())
+
+    def st_on_entry_key(self, _entry, event):
+        """Arrows walk the results without taking focus off the entry."""
+        lb = self.st.get('list')
+        if lb is None or event.keyval not in (Gdk.KEY_Up, Gdk.KEY_Down):
+            return False
+        row = lb.get_selected_row()
+        idx = row.get_index() if row else -1
+        idx += 1 if event.keyval == Gdk.KEY_Down else -1
+        nxt = lb.get_row_at_index(max(0, idx))
+        if nxt:
+            lb.select_row(nxt)
+            self.st_scroll_to(nxt)
+        return True
+
+    def st_scroll_to(self, row):
+        scroll = self.st.get('scroll')
+        if scroll is None:
+            return
+        adj = scroll.get_vadjustment()
+        alloc = row.get_allocation()
+        top, bottom = adj.get_value(), adj.get_value() + adj.get_page_size()
+        if alloc.y < top:
+            adj.set_value(alloc.y)
+        elif alloc.y + alloc.height > bottom:
+            adj.set_value(alloc.y + alloc.height - adj.get_page_size())
+
+    def st_app_press(self, event, info):
+        menu = Gtk.Menu()
+        app_id = info.get_id()
+
+        mi = Gtk.MenuItem(label='Open')
+        mi.connect('activate', lambda _m: self.st_launch(info))
+        menu.append(mi)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        pinned_start = app_id in self.start_pinned
+        mi = Gtk.MenuItem(label='Unpin from Start' if pinned_start
+                          else 'Pin to Start')
+        mi.connect('activate',
+                   lambda _m: self.start_pin(app_id, not pinned_start))
+        menu.append(mi)
+
+        on_bar = app_id in self.pinned
+        mi = Gtk.MenuItem(label='Unpin from taskbar' if on_bar
+                          else 'Pin to taskbar')
+        mi.connect('activate',
+                   lambda _m: (self.unpin(app_id) if on_bar
+                               else self.pin(app_id)))
+        menu.append(mi)
+
+        shortcut = desktop_shortcut_path(info)
+        mi = Gtk.MenuItem(label='Add to desktop')
+        if shortcut is None or os.path.exists(shortcut):
+            mi.set_sensitive(False)
+        else:
+            mi.connect('activate', lambda _m: add_to_desktop(info))
+        menu.append(mi)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def st_file_press(self, event, path):
+        menu = Gtk.Menu()
+        mi = Gtk.MenuItem(label='Open')
+        mi.connect('activate', lambda _m: self.st_open_path(path))
+        menu.append(mi)
+        mi = Gtk.MenuItem(label='Open containing folder')
+        mi.connect('activate',
+                   lambda _m: self.st_open_path(os.path.dirname(path)))
+        menu.append(mi)
+        menu.append(Gtk.SeparatorMenuItem())
+        dest = os.path.join(DESKTOP_DIR, os.path.basename(path.rstrip('/')))
+        mi = Gtk.MenuItem(label='Add to desktop')
+        if os.path.lexists(dest):
+            mi.set_sensitive(False)
+        else:
+            mi.connect('activate', lambda _m: link_to_desktop(path))
+        menu.append(mi)
+        menu.show_all()
+        menu.popup_at_pointer(event)
         return True
 
     # ---------- quick settings (volume / mic / media / night light) -----
@@ -1113,7 +2352,7 @@ class Dock(Gtk.Window):
             self.qs_widgets['nightlbl'] = nlbl
         return row
 
-    # ---------- night light: Off → warm steps → pure red ----------
+    # ---------- night light: Off → warm steps → red shaders ----------
     def _night_load(self):
         try:
             with open(NIGHT_STATE) as f:
@@ -1136,45 +2375,72 @@ class Dock(Gtk.Window):
 
     @staticmethod
     def _night_shader_on():
+        """Which night shader file is active: 'red', 'redonly', or None."""
         try:
             out = subprocess.run(
                 ['hyprctl', 'getoption', 'decoration:screen_shader', '-j'],
                 capture_output=True, text=True, timeout=2).stdout
-            return os.path.basename(NIGHT_SHADER) in out
         except Exception:
-            return False
+            return None
+        if os.path.basename(NIGHT_SHADER_REDONLY) in out:
+            return 'redonly'
+        if os.path.basename(NIGHT_SHADER) in out:
+            return 'red'
+        return None
 
     def _night_reconcile(self):
-        """Drop back to reality if hyprsunset/the shader were toggled
+        """Drop back to reality if hyprsunset/the shaders were toggled
         behind our back (killed manually, hyprctl reload, …)."""
         _, val = NIGHT_STEPS[self.night_step]
-        if val == 'red':
-            if not self._night_shader_on():
+        if val in ('red', 'redonly'):
+            if self._night_shader_on() != val:
                 self.night_step = 0
         elif val is not None:
             if not self._night_running():
                 self.night_step = 0
         else:
-            if self._night_shader_on():
-                self.night_step = len(NIGHT_STEPS) - 1
+            shader = self._night_shader_on()
+            if shader:
+                self.night_step = next(i for i, (_, v) in
+                                       enumerate(NIGHT_STEPS) if v == shader)
             elif self._night_running():
                 self.night_step = 1
 
+    @staticmethod
+    def _night_shader_set(path):
+        """Point decoration:screen_shader at `path` (or clear it).
+        hyprctl keyword is rejected by the non-legacy (lua) parser, so
+        write the path to night-shader.conf — read natively by
+        hyprland.lua — and hyprctl reload, same trick as the theme CLI.
+        Skips the reload when nothing changed."""
+        want = path or ''
+        try:
+            with open(NIGHT_SHADER_CONF) as f:
+                if f.read().strip() == want:
+                    return
+        except OSError:
+            pass
+        try:
+            with open(NIGHT_SHADER_CONF, 'w') as f:
+                f.write(want + '\n' if want else '')
+        except OSError:
+            return
+        subprocess.run(['hyprctl', 'reload'], capture_output=True)
+
     def _night_apply(self):
         _, val = NIGHT_STEPS[self.night_step]
-        if val == 'red':
+        if val in ('red', 'redonly'):
             subprocess.run(['pkill', '-x', 'hyprsunset'],
                            capture_output=True)
-            if not os.path.exists(NIGHT_SHADER):
-                with open(NIGHT_SHADER, 'w') as f:
-                    f.write(NIGHT_SHADER_SRC)
-            subprocess.run(['hyprctl', 'keyword',
-                            'decoration:screen_shader', NIGHT_SHADER],
-                           capture_output=True)
+            path, src = ((NIGHT_SHADER, NIGHT_SHADER_SRC) if val == 'red'
+                         else (NIGHT_SHADER_REDONLY,
+                               NIGHT_SHADER_REDONLY_SRC))
+            if not os.path.exists(path):
+                with open(path, 'w') as f:
+                    f.write(src)
+            self._night_shader_set(path)
             return
-        subprocess.run(['hyprctl', 'keyword',
-                        'decoration:screen_shader', '[[EMPTY]]'],
-                       capture_output=True)
+        self._night_shader_set('')
         if val is None:
             subprocess.run(['pkill', '-x', 'hyprsunset'],
                            capture_output=True)
@@ -1234,8 +2500,7 @@ class Dock(Gtk.Window):
             name, val = NIGHT_STEPS[self.night_step]
             ctx = qw['night'].get_style_context()
             ctx.add_class('on') if val else ctx.remove_class('on')
-            qw['nightlbl'].set_label(
-                f'Night light · {name}' if val else 'Night light')
+            qw['nightlbl'].set_label('Night light')
 
         if 'title' in qw and qw.get('player'):
             try:
@@ -1717,6 +2982,12 @@ class Dock(Gtk.Window):
         n = len(g['windows'])
         if n == 0:
             self.launch(g)
+            return
+        # Anki: always "open here" / stash via anki-toggle (scratchpad + tray)
+        if g.get('id') == 'anki.desktop':
+            subprocess.Popen(
+                [os.path.expanduser('~/.local/bin/anki-toggle'), 'toggle'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
         if n == 1:
             addr = g['windows'][0]['address']
@@ -2442,6 +3713,15 @@ class Dock(Gtk.Window):
                 mi.connect('activate', lambda _m: self.pin(g['id']))
             menu.append(mi)
 
+            shortcut = desktop_shortcut_path(g['info'])
+            mi = Gtk.MenuItem(label='Add to desktop')
+            if shortcut is None or os.path.exists(shortcut):
+                mi.set_sensitive(False)     # no .desktop, or already there
+            else:
+                mi.connect('activate',
+                           lambda _m: add_to_desktop(g['info']))
+            menu.append(mi)
+
             mi = Gtk.MenuItem(label='Hide to tray')
             mi.connect('activate', lambda _m: self.tray_tag(g['id']))
             menu.append(mi)
@@ -2507,5 +3787,6 @@ class Dock(Gtk.Window):
 if __name__ == '__main__':
     if not os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
         sys.exit('winbar-dock: not inside a Hyprland session')
+    install_theme_signal_handlers()
     Dock()
     Gtk.main()

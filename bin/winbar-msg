@@ -5,8 +5,9 @@
 #   quick                           (quick settings panel)
 #   tray                            (tray overflow popup)
 #   start                           (start menu w/ click-off backdrop)
-# Falls back to plain hyprland cycling / bare rofi if the dock
-# isn't running.
+# Falls back to plain hyprland cycling if the dock isn't running.
+# The start menu itself lives in winbar-dock now; the rofi fallback
+# below only fires when the dock is dead, as a way back in.
 import os
 import socket
 import subprocess
