@@ -28,8 +28,11 @@ WB_WIN_S="${WB_DIR}/windows/style.css"
 # Prefer patched hyprpaper-era waybar (CSS hot-swap on SIGUSR2). Bare
 # `waybar` often resolves to /usr/bin in hypr exec PATH → first theme
 # apply then kill+restarts it (top bar flash after leaving winmode).
-if [ -x "${HOME}/.local/bin/waybar" ]; then
+# A library update can invalidate the local build; use the distro bar until rebuilt.
+if [ -x "${HOME}/.local/bin/waybar" ] && "${HOME}/.local/bin/waybar" --version >/dev/null 2>&1; then
     WAYBAR="${HOME}/.local/bin/waybar"
+elif [ -x /usr/bin/waybar ]; then
+    WAYBAR="/usr/bin/waybar"
 else
     WAYBAR="$(command -v waybar 2>/dev/null || echo waybar)"
 fi

@@ -5,6 +5,9 @@
 #   quick                           (quick settings panel)
 #   tray                            (tray overflow popup)
 #   start                           (start menu w/ click-off backdrop)
+#   weather                         (weather flyout)
+#   weather-location                (weather flyout, location picker open)
+#   net | clock                     (internet / calendar flyouts)
 # Falls back to plain hyprland cycling if the dock isn't running.
 # The start menu itself lives in winbar-dock now; the rofi fallback
 # below only fires when the dock is dead, as a way back in.
@@ -33,4 +36,6 @@ except OSError:
             [os.path.expanduser('~/.local/bin/rofi-apps'),
              '-show', 'combi', '-theme',
              os.path.expanduser('~/.config/rofi/winmode-start.rasi')])
+    elif cmd == 'weather':
+        subprocess.Popen(['xdg-open', 'https://wttr.in'])
     # minimize has no sensible fallback outside winmode / dock

@@ -37,6 +37,8 @@ import socket
 import subprocess
 import sys
 import threading
+import time
+import urllib.parse
 import urllib.request
 
 # name the process so pgrep/pkill -x winbar-dock works
@@ -74,6 +76,11 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('GtkLayerShell', '0.1')
 from gi.repository import (Gtk, Gdk, GLib, Gio, GdkPixbuf,  # noqa: E402
                            GtkLayerShell, Pango)
+try:
+    gi.require_version('DbusmenuGtk3', '0.4')
+    from gi.repository import DbusmenuGtk3  # noqa: E402
+except (ValueError, ImportError):
+    DbusmenuGtk3 = None
 
 
 # ---- theme.css hot-reload (SIGHUP / SIGUSR1 from `theme apply`) ----
@@ -117,12 +124,64 @@ def accent_css(theme_css):
                       theme_css or '')
         hexcol = m.group(1) if m else '#6cb8ff'
     r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+    # panel tint: mix the accent into the neutral acrylic base (30,30,32);
+    # alpha stays at 0.72 so hyprland's ignore_alpha blur still applies
+    t = 0.18
+    tr, tg, tb = (round(c0 * (1 - t) + c * t)
+                  for c0, c in ((30, r), (30, g), (32, b)))
     return f"""
+.startcard {{
+    background: rgba({tr},{tg},{tb},0.72);
+    border: 1px solid rgba({r},{g},{b},0.28);
+}}
+.stfooter {{
+    background: rgba({r},{g},{b},0.08);
+    border-top: 1px solid rgba({r},{g},{b},0.18);
+}}
 list.stlist row:selected {{ background: rgba({r},{g},{b},0.32); }}
 button.stpower:hover {{ background: rgba({r},{g},{b},0.50); }}
 .stsearch:focus-within {{ border: 1px solid rgba({r},{g},{b},0.70); }}
 .stcat:hover {{ border: 1px solid rgba({r},{g},{b},0.45); }}
 .stuser image {{ color: rgba({r},{g},{b},1.0); }}
+.wxcard {{
+    background: rgba({tr},{tg},{tb},0.72);
+    border: 1px solid rgba({r},{g},{b},0.28);
+}}
+.wxfooter {{
+    background: rgba({r},{g},{b},0.08);
+    border-top: 1px solid rgba({r},{g},{b},0.18);
+}}
+.wxhour.now {{ background: rgba({r},{g},{b},0.22); }}
+.wxpin {{ color: rgba({r},{g},{b},1.0); }}
+.wxsearch {{ border: 1px solid rgba({r},{g},{b},0.70); }}
+.wxcard .clkday.clktoday {{
+    background: rgb({r},{g},{b}); color: #101216; font-weight: 700;
+}}
+.netglyph.online {{
+    color: rgb({r},{g},{b}); background: rgba({r},{g},{b},0.16);
+}}
+.netwglyph.online {{ color: rgb({r},{g},{b}); }}
+.wxcard .netrate.down {{ color: rgb({r},{g},{b}); }}
+button.wxtoggle.on {{ background: rgb({r},{g},{b}); }}
+button.wxtoggle.on:hover {{ background: rgba({r},{g},{b},0.85); }}
+.qscard {{
+    background: rgba({tr},{tg},{tb},0.72);
+    border: 1px solid rgba({r},{g},{b},0.28);
+}}
+menu, .menu {{
+    background: rgba({tr},{tg},{tb},0.98);
+    border: 1px solid rgba({r},{g},{b},0.28);
+    border-radius: 8px; padding: 4px; color: #f3f3f3;
+}}
+menu label, .menu label {{ font-family: "Noto Sans", sans-serif; font-size: 12.5px; }}
+menu menuitem {{ padding: 5px 12px; border-radius: 5px; }}
+menu menuitem:hover, .menu menuitem:hover {{
+    background: rgba({r},{g},{b},0.22);
+}}
+menu menuitem:disabled label {{ color: rgba(255,255,255,0.40); }}
+menu separator {{
+    background: rgba({r},{g},{b},0.22); min-height: 1px; margin: 4px 6px;
+}}
 """
 
 
@@ -163,6 +222,45 @@ def install_theme_signal_handlers():
     signal.signal(signal.SIGUSR1, _theme_signal)
 
 
+_THEME_MONITORS = []
+_theme_reload_pending = False
+
+def install_theme_file_monitors():
+    """Reload when wallaccent / theme apply rewrite their files.
+
+    wallaccent is a binary that never signals us, so watch the files it
+    writes. Monitor the parent dirs: atomic rename-writes swap the inode
+    out from under a per-file monitor."""
+    watched = {}
+    for path in (_THEME_CSS, WALLACCENT_CSS, WALLACCENT_RASI):
+        watched.setdefault(os.path.dirname(path), set()).add(
+            os.path.basename(path))
+
+    def debounced():
+        global _theme_reload_pending
+        _theme_reload_pending = False
+        load_theme_css()
+        return False
+
+    def changed(_mon, f, other, _event, names):
+        global _theme_reload_pending
+        # rename-writes report the temp file as `f`, the target as `other`
+        hit = any(x and x.get_basename() in names for x in (f, other))
+        if hit and not _theme_reload_pending:
+            _theme_reload_pending = True
+            GLib.timeout_add(150, debounced)
+
+    for d, names in watched.items():
+        try:
+            mon = Gio.File.new_for_path(d).monitor_directory(
+                Gio.FileMonitorFlags.WATCH_MOVES, None)
+        except GLib.Error as e:
+            print(f'winbar-dock: cannot watch {d}: {e}', file=sys.stderr)
+            continue
+        mon.connect('changed', changed, names)
+        _THEME_MONITORS.append(mon)  # keep alive
+
+
 MARGIN_LEFT = 205          # px, sits right after the search pill
 BAR_HEIGHT = 48
 ICON_SIZE = 26
@@ -184,6 +282,10 @@ ART_DIR = os.path.expanduser('~/.cache/winbar/art')
 # monitor picks it up and gives it the next free grid cell.
 DESKTOP_DIR = os.path.expanduser('~/Desktop')
 DEFAULT_TRAY = ['com.obsproject.Studio.desktop']
+# Status-notifier icons collapsed out of waybar's tray (right-click an icon
+# there → "Collapse into overflow"). JSON array of SNI Ids; waybar watches
+# it (tray "hidden-file" option), we read it whenever the popup opens.
+SNI_HIDDEN_FILE = os.path.join(CONFIG_DIR, 'tray-hidden.json')
 MINIMIZED_WS = 'special:minimized'
 MINIMIZED_FILE = os.path.expanduser('~/.local/state/winmode/minimized.json')
 
@@ -279,6 +381,57 @@ void main() {
     fragColor = vec4(c.r, 0.0, 0.0, c.a);
 }
 """
+# weather flyout (waybar custom/weather → `winbar-msg weather`)
+WX_CACHE = os.path.expanduser('~/.cache/waybar-weather.json')
+NET_W = 400                 # internet flyout
+NET_HIST = 60               # live view: last 60 one-second samples
+NET_SESS_N = 120            # session view: points kept; when 2x fills,
+                            # pairs merge and each point covers twice as long
+NET_MAX_WIFI = 12
+NET_LIST_H = 230
+NET_SPOILERS = ('Public IP', 'Tailscale')   # hidden until clicked
+CLK_W = 340                 # clock / calendar flyout
+QS_W = 380                  # quick settings card width
+MD_ART = 96                 # media card cover size
+
+WX_LOC_FILE = os.path.expanduser('~/.config/winbar/weather-location')
+
+
+def wx_location():
+    """User-picked place for wttr.in ('' = locate by IP)."""
+    try:
+        with open(WX_LOC_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def wx_url(loc):
+    return f'https://wttr.in/{urllib.parse.quote(loc)}?format=j1'
+WX_MAX_AGE = 600            # s; older cache gets refetched on open
+WX_W = 420
+WX_HOURS = 7                # columns in the hourly strip
+WX_BAR_W = 120              # daily temperature range bar
+WX_ICONS = {
+    'clear': '\U000F0599', 'night': '\U000F0594',
+    'partly': '\U000F0595', 'partly_n': '\U000F0F31',
+    'cloudy': '\U000F0590', 'fog': '\U000F0591',
+    'rain': '\U000F0597', 'pour': '\U000F0596',
+    'sleet': '\U000F067F', 'snow': '\U000F0598',
+    'thunder': '\U000F067E',
+}
+WX_GROUPS = {
+    'partly': {116},
+    'cloudy': {119, 122},
+    'fog': {143, 248, 260},
+    'rain': {176, 263, 266, 293, 296, 353},
+    'pour': {299, 302, 305, 308, 356, 359},
+    'sleet': {179, 182, 185, 281, 284, 311, 314, 317, 350, 362, 365,
+              374, 377},
+    'snow': {227, 230, 323, 326, 329, 332, 335, 338, 368, 371, 392, 395},
+    'thunder': {200, 386, 389},
+}
+
 DEFAULT_PINNED = [
     'waterfox.desktop',
     'org.kde.dolphin.desktop',
@@ -394,9 +547,11 @@ button.traybtn {
     background: transparent; border: none; box-shadow: none;
     border-radius: 8px; padding: 7px;
     min-width: 0; min-height: 0;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1);
 }
 button.traybtn:hover { background: rgba(255,255,255,0.10); }
-.traylabel { color: #9aa3b2; font-size: 11px; }
+button.traybtn:active { background: rgba(255,255,255,0.06); }
+.wxcard .traylabel { color: rgba(255,255,255,0.55); font-size: 11.5px; }
 
 /* ---- task view ---- */
 .tvbackdrop { background: rgba(0,0,0,0.35); }
@@ -534,6 +689,263 @@ scrolledwindow.stscroll scrollbar slider {
 }
 scrolledwindow.stscroll scrollbar slider:hover {
     background: rgba(255,255,255,0.35);
+}
+
+/* ---- quick settings card + media ---- */
+.qscard {
+    font-family: "Noto Sans", sans-serif;
+    background: rgba(30,30,32,0.72);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 14px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55);
+}
+.qscard label { color: #f3f3f3; }
+.mdsrc { font-size: 11.5px; font-weight: 600; }
+.qscard .mdstate, .qscard .mdtime {
+    color: rgba(255,255,255,0.60); font-size: 11px;
+}
+.qscard .mdtime { font-size: 10.5px; }
+.qscard .mdtitle { font-size: 15px; font-weight: 700; }
+.qscard .mdartist { color: rgba(255,255,255,0.85); font-size: 12.5px; }
+.qscard .mdalbum { color: rgba(255,255,255,0.55); font-size: 11.5px; }
+button.mdbtn {
+    font-family: "Commit Mono Nerd Font";
+    background: transparent; border: none; box-shadow: none;
+    color: #f3f3f3; min-width: 0; min-height: 0;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1),
+                color 160ms cubic-bezier(0.2,0,0,1);
+}
+button.mdbtn:hover { background: rgba(255,255,255,0.12); }
+button.mdbtn:active { background: rgba(255,255,255,0.06); }
+button.mdmini {
+    font-size: 13px; padding: 2px 6px; border-radius: 6px;
+    color: rgba(255,255,255,0.75);
+}
+button.mdskip { font-size: 22px; padding: 6px 8px; border-radius: 99px; }
+button.mdside {
+    font-size: 15px; padding: 6px 8px; border-radius: 99px;
+    color: rgba(255,255,255,0.55);
+}
+button.mdplay {
+    font-size: 24px;
+    min-width: 52px; min-height: 52px;
+    padding: 0; border-radius: 99px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+.mdcard {
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding-bottom: 2px;
+}
+.qscard .qsbtn { background: rgba(255,255,255,0.07); }
+.qscard .qsbtn:hover { background: rgba(255,255,255,0.14); }
+
+/* ---- internet flyout ---- */
+.netglyph {
+    font-family: "Commit Mono Nerd Font"; font-size: 30px;
+    color: rgba(255,255,255,0.55);
+    background: rgba(255,255,255,0.07);
+    border-radius: 14px;
+    min-width: 56px; min-height: 56px;
+}
+.wxcard .nettitle { font-size: 16px; font-weight: 700; }
+.wxcard .netpill {
+    font-size: 10.5px; font-weight: 600;
+    border-radius: 99px; padding: 1px 8px;
+}
+.wxcard .netpill.on  { background: rgba(110,220,140,0.18); color: #8ee6a8; }
+.wxcard .netpill.off { background: rgba(255,120,110,0.18); color: #ff8a80; }
+.netgraphbox {
+    background: rgba(255,255,255,0.04);
+    border-radius: 10px;
+    padding: 10px 12px 8px 12px;
+}
+.wxcard .netrate {
+    font-family: "Commit Mono Nerd Font", "Noto Sans";
+    font-size: 12.5px; font-weight: 600;
+}
+.wxcard .netrate.up { color: rgba(255,255,255,0.70); }
+.wxcard .netval { font-size: 12.5px; font-weight: 600; }
+.netwglyph {
+    font-family: "Commit Mono Nerd Font"; font-size: 18px;
+    color: rgba(255,255,255,0.70); min-width: 22px;
+}
+.wxcard .netlock {
+    font-family: "Commit Mono Nerd Font"; font-size: 12px;
+    color: rgba(255,255,255,0.45);
+}
+list.netlist { background: transparent; }
+list.netlist row {
+    background: transparent; border-radius: 8px; padding: 7px 8px;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1);
+}
+list.netlist row:hover { background: rgba(255,255,255,0.06); }
+button.wxtoggle {
+    background: rgba(255,255,255,0.16); background-image: none;
+    border: none; box-shadow: none; border-radius: 99px;
+    min-width: 40px; min-height: 0; padding: 3px;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1);
+}
+button.wxtoggle:hover { background: rgba(255,255,255,0.24); }
+.wxknob {
+    background: #f3f3f3; border-radius: 99px;
+    min-width: 16px; min-height: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+}
+
+.wxcard .netcap {
+    font-family: "Noto Sans", "Commit Mono Nerd Font";
+    color: rgba(255,255,255,0.50); font-size: 10.5px;
+}
+button.nettab {
+    background: transparent; border: none; box-shadow: none;
+    color: rgba(255,255,255,0.50);
+    font-size: 10.5px; font-weight: 600;
+    border-radius: 99px; padding: 1px 9px;
+    min-height: 0; min-width: 0;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1),
+                color 160ms cubic-bezier(0.2,0,0,1);
+}
+button.nettab:hover { color: #f3f3f3; background: rgba(255,255,255,0.07); }
+button.nettab.on { color: #f3f3f3; background: rgba(255,255,255,0.12); }
+
+.wxcard .netval.spoiler {
+    color: transparent;
+    background: rgba(255,255,255,0.20);
+    border-radius: 4px;
+}
+.wxcard .netspoileye {
+    font-family: "Commit Mono Nerd Font"; font-size: 12px;
+    color: rgba(255,255,255,0.40);
+}
+
+/* ---- clock flyout ---- */
+.wxcard .clkbig { font-size: 52px; font-weight: 300; }
+.wxcard .clksec { font-size: 22px; font-weight: 300; color: rgba(255,255,255,0.55); }
+.wxcard .clkampm { font-size: 14px; font-weight: 600; color: rgba(255,255,255,0.70); }
+.wxcard .clkdate { font-size: 13.5px; color: rgba(255,255,255,0.80); }
+.clkcal {
+    background: rgba(255,255,255,0.04);
+    border-radius: 12px;
+    padding: 10px 10px 12px 10px;
+}
+button.clkmonth { font-size: 13px; font-weight: 700; margin: 0; }
+.wxcard .clkwd {
+    font-size: 10.5px; font-weight: 600;
+    color: rgba(255,255,255,0.45); padding: 4px 0;
+}
+.wxcard .clkday { font-size: 12.5px; border-radius: 99px; }
+.wxcard .clkday.weekend { color: rgba(255,255,255,0.75); }
+.wxcard .clkday.other { color: rgba(255,255,255,0.25); }
+
+/* ---- weather flyout ---- */
+button.wxplacebtn {
+    background: transparent; border: 1px solid transparent;
+    box-shadow: none; border-radius: 8px;
+    padding: 4px 8px; margin: -4px 0 -4px -8px;
+    min-height: 0; min-width: 0;
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1),
+                border-color 160ms cubic-bezier(0.2,0,0,1);
+}
+button.wxplacebtn:hover {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.09);
+}
+.wxcard .wxchev {
+    font-family: "Commit Mono Nerd Font";
+    font-size: 13px; color: rgba(255,255,255,0.45);
+}
+button.wxplacebtn:hover .wxchev { color: rgba(255,255,255,0.85); }
+.wxsearch {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 20px;
+    padding: 0 6px 0 14px;
+}
+entry.wxentry {
+    background: transparent; border: none; box-shadow: none;
+    outline: none; color: #f3f3f3; caret-color: #f3f3f3;
+    font-size: 13px; min-height: 36px; padding: 0 4px;
+}
+entry.wxentry placeholder { color: rgba(255,255,255,0.45); }
+.wxcard .wxerr { color: #ff8a80; font-size: 11.5px; }
+.wxcard {
+    font-family: "Noto Sans", sans-serif;
+    background: rgba(30,30,32,0.72);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.55);
+}
+.wxcard label { color: #f3f3f3; }
+.wxglyph { font-family: "Commit Mono Nerd Font"; }
+.wxhero { font-size: 58px; }
+.wxsmall { font-size: 20px; }
+.wxcard .wx-clear    { color: #ffcc4d; }
+.wxcard .wx-night    { color: #c3ccff; }
+.wxcard .wx-partly   { color: #ffd88a; }
+.wxcard .wx-partly_n { color: #b8c2f0; }
+.wxcard .wx-cloudy   { color: #cfd8e3; }
+.wxcard .wx-fog      { color: #aab5c0; }
+.wxcard .wx-rain     { color: #74b9ff; }
+.wxcard .wx-pour     { color: #4c9bff; }
+.wxcard .wx-sleet    { color: #a6dcf2; }
+.wxcard .wx-snow     { color: #eaf6ff; }
+.wxcard .wx-thunder  { color: #ffb347; }
+.wxtemp { font-size: 50px; font-weight: 300; }
+.wxdesc { font-size: 15px; font-weight: 600; }
+.wxcard .wxsub { color: rgba(255,255,255,0.70); font-size: 12px; }
+.wxcard .wxdim { color: rgba(255,255,255,0.50); font-size: 11px; }
+.wxplace { font-size: 13px; font-weight: 600; }
+.wxpin { font-family: "Commit Mono Nerd Font"; font-size: 16px; }
+.wxhdr { color: rgba(255,255,255,0.85); font-size: 12px; font-weight: 600; }
+.wxval { font-size: 12.5px; font-weight: 600; }
+.wxcard .wxrain {
+    font-family: "Commit Mono Nerd Font", "Noto Sans";
+    color: #74b9ff; font-size: 10.5px;
+}
+.wxchip {
+    background: rgba(255,255,255,0.055);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+.wxchipglyph {
+    font-family: "Commit Mono Nerd Font";
+    font-size: 12px;
+}
+.wxchipval { font-size: 13px; font-weight: 600; }
+.wxstrip {
+    background: rgba(255,255,255,0.04);
+    border-radius: 10px;
+    padding: 8px 4px;
+}
+.wxhour { border-radius: 8px; padding: 6px 0 4px 0; }
+.wxday { border-radius: 6px; padding: 7px 8px; }
+.wxday:hover { background: rgba(255,255,255,0.06); }
+.wxfooter {
+    background: rgba(255,255,255,0.04);
+    border-top: 1px solid rgba(255,255,255,0.07);
+    border-radius: 0 0 12px 12px;
+    min-height: 44px;
+}
+button.wxlink, button.wxicon {
+    color: #f3f3f3;
+    background: transparent;
+    border: 1px solid transparent;
+    box-shadow: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11.5px;
+    min-height: 0; min-width: 0;
+}
+button.wxlink { font-family: "Noto Sans", "Commit Mono Nerd Font"; margin: 6px 0; }
+button.wxicon { font-family: "Commit Mono Nerd Font"; font-size: 15px; }
+button.wxlink:hover, button.wxicon:hover {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.10);
+}
+.wxday, .wxchip, button.wxlink, button.wxicon {
+    transition: background-color 160ms cubic-bezier(0.2,0,0,1),
+                border-color 160ms cubic-bezier(0.2,0,0,1);
 }
 """
 
@@ -867,12 +1279,24 @@ def is_minimized_ws(ws):
 
 
 class AppResolver:
-    """class name -> Gio.DesktopAppInfo (cached)"""
+    """window class -> Gio.DesktopAppInfo, plus an icon of last resort.
+
+    Plain class/StartupWMClass/exec matching misses a lot: Steam games
+    (class steam_app_<id>), Wine/Proton apps (class foo.exe, launched via
+    "env WINEPREFIX=... wine ...foo.exe"), flatpaks and anything whose
+    binary name differs from its class. Those fall through to the
+    process (SteamAppId / FLATPAK_ID / argv[0]) and finally to the
+    window's own X11 _NET_WM_ICON, cached as a png."""
 
     def __init__(self):
         self.cache = {}
+        self.icon_cache = {}
+        self.icon_miss = {}
         self.by_wmclass = {}
         self.by_exec = {}
+        self.by_exe = {}        # wine: "foo.exe" -> info
+        self.by_steam = {}      # "252950" -> info
+        self.by_name = {}
         for info in Gio.DesktopAppInfo.get_all():
             wmc = info.get_startup_wm_class()
             if wmc:
@@ -880,8 +1304,21 @@ class AppResolver:
             exe = info.get_executable()
             if exe:
                 self.by_exec.setdefault(os.path.basename(exe).lower(), info)
+            cmd = info.get_commandline() or ''
+            m = re.search(r'rungameid/(\d+)', cmd)
+            if m:
+                self.by_steam.setdefault(m.group(1), info)
+            icon = info.get_string('Icon') or ''
+            m = re.fullmatch(r'steam_icon_(\d+)', icon)
+            if m:
+                self.by_steam.setdefault(m.group(1), info)
+            for m in re.finditer(r'([^\\/"\' ]+\.exe)\b', cmd, re.I):
+                self.by_exe.setdefault(m.group(1).lower(), info)
+            name = re.sub(r'[^a-z0-9]', '', (info.get_name() or '').lower())
+            if name:
+                self.by_name.setdefault(name, info)
 
-    def resolve(self, cls):
+    def resolve(self, cls, pid=None):
         if cls in self.cache:
             return self.cache[cls]
         info = None
@@ -889,12 +1326,168 @@ class AppResolver:
             info = desktop_info(cand + '.desktop')
             if info:
                 break
+        low = cls.lower()
         if not info:
-            info = self.by_wmclass.get(cls.lower())
+            info = self.by_wmclass.get(low)
         if not info:
-            info = self.by_exec.get(cls.lower())
+            info = self.by_exec.get(low)
+        if not info:
+            m = re.fullmatch(r'steam_app_(\d+)', low)
+            if m:
+                info = self.by_steam.get(m.group(1))
+        if not info and low.endswith('.exe'):
+            info = (self.by_exe.get(low)
+                    or self.by_name.get(re.sub(r'[^a-z0-9]', '', low[:-4])))
+        if not info and pid:
+            info = self._from_proc(pid, wine=low.endswith('.exe'))
+        if not info and not low.endswith('.exe'):
+            info = self.by_name.get(re.sub(r'[^a-z0-9]', '', low))
         self.cache[cls] = info
         return info
+
+    def _from_proc(self, pid, wine=False):
+        try:
+            with open(f'/proc/{pid}/environ', 'rb') as f:
+                env = dict(kv.split(b'=', 1) for kv in f.read().split(b'\0')
+                           if b'=' in kv)
+        except OSError:
+            env = {}
+        sid = (env.get(b'SteamAppId') or env.get(b'SteamGameId') or b'').decode()
+        if sid and sid != '0' and sid in self.by_steam:
+            return self.by_steam[sid]
+        if wine:
+            return None   # the flatpak/runner (Vinegar, Bottles) isn't the app
+        fid = env.get(b'FLATPAK_ID', b'').decode()
+        if fid:
+            info = desktop_info(fid + '.desktop')
+            if info:
+                return info
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                argv0 = f.read().split(b'\0')[0].decode(errors='ignore')
+            return self.by_exec.get(os.path.basename(argv0).lower())
+        except OSError:
+            return None
+
+    def fallback_icon(self, cls):
+        """GIcon for a class with no .desktop: steam_icon_<id>, the class as
+        a theme icon, or the window's own X11 icon. None if nothing real."""
+        if cls in self.icon_cache:
+            return self.icon_cache[cls]
+        if time.time() - self.icon_miss.get(cls, 0) < 5:
+            return None
+        icon = None
+        theme = Gtk.IconTheme.get_default()
+        m = re.fullmatch(r'steam_app_(\d+)', cls.lower())
+        names = ([f'steam_icon_{m.group(1)}'] if m else []) + [cls, cls.lower()]
+        for n in names:
+            if n and theme.has_icon(n):
+                icon = Gio.ThemedIcon.new(n)
+                break
+        if icon is None:
+            path = x11_icon_png(cls)
+            if path:
+                icon = Gio.FileIcon.new(Gio.File.new_for_path(path))
+        if icon is not None:
+            self.icon_cache[cls] = icon
+        else:   # X windows may not have set an icon yet: retry later
+            self.icon_miss[cls] = time.time()
+        return icon
+
+
+X_ICON_DIR = os.path.expanduser('~/.cache/winbar/icons')
+
+
+def x11_icon_png(cls):
+    """Pull _NET_WM_ICON off an Xwayland window of this class and cache the
+    biggest non-blank image as a png. Wine sets it from the .exe's icon."""
+    out = os.path.join(X_ICON_DIR, re.sub(r'[^\w.-]', '_', cls) + '.png')
+    try:
+        if os.path.getsize(out) > 0:
+            return out
+    except OSError:
+        pass
+    try:
+        lst = subprocess.run(['xprop', '-root', '_NET_CLIENT_LIST'],
+                             capture_output=True, text=True, timeout=1).stdout
+    except Exception:
+        return None
+    best = None
+    for wid in re.findall(r'0x[0-9a-f]+', lst):
+        try:
+            r = subprocess.run(['xprop', '-id', wid, '-notype', 'WM_CLASS',
+                                '32c', '_NET_WM_ICON'],
+                               capture_output=True, text=True, timeout=1).stdout
+        except Exception:
+            continue
+        mc = re.search(r'WM_CLASS\s*=\s*(.*)', r)
+        if not mc or cls.lower() not in [x.lower() for x in
+                                          re.findall(r'"([^"]*)"', mc.group(1))]:
+            continue
+        mi = re.search(r'_NET_WM_ICON\s*=\s*([\d,\s]+)', r)
+        if not mi:
+            continue
+        nums = [int(x) for x in re.findall(r'\d+', mi.group(1))]
+        i = 0
+        while i + 2 <= len(nums):
+            w, h = nums[i], nums[i + 1]
+            px = nums[i + 2:i + 2 + w * h]
+            i += 2 + w * h
+            if not w or len(px) != w * h or not any(p >> 24 for p in px):
+                continue
+            if best is None or w * h > best[0] * best[1]:
+                best = (w, h, px)
+    if not best:
+        return None
+    w, h, px = best
+    data = bytearray()
+    for p in px:   # ARGB cardinal -> RGBA bytes
+        data += bytes(((p >> 16) & 255, (p >> 8) & 255, p & 255, (p >> 24) & 255))
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(data)),
+                                             GdkPixbuf.Colorspace.RGB, True,
+                                             8, w, h, w * 4)
+        os.makedirs(X_ICON_DIR, exist_ok=True)
+        pb.savev(out + '.tmp', 'png', [], [])
+        os.replace(out + '.tmp', out)
+        return out
+    except Exception:
+        return None
+
+
+class MirrorStrip(Gtk.Window):
+    """The app strip on a secondary monitor: same groups and order as the
+    main dock, its own buttons. All interaction is handled by the Dock."""
+
+    def __init__(self, mon):
+        super().__init__(title='winbar-dock')
+        self.mon_name = mon.get('name')
+        self.mon_id = mon.get('id')
+        self.mon_x = mon.get('x', 0)
+        self.mon_y = mon.get('y', 0)
+        self.mon_w = mon.get('width', 1920)
+        self.mon_h = mon.get('height', 1080)
+        self.buttons = {}
+        LS = GtkLayerShell
+        LS.init_for_window(self)
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        LS.set_anchor(self, LS.Edge.LEFT, True)
+        LS.set_anchor(self, LS.Edge.BOTTOM, True)
+        LS.set_margin(self, LS.Edge.LEFT, MARGIN_LEFT)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_namespace(self, 'winbar-dock')
+        self.gdk_mon = Gdk.Display.get_default().get_monitor_at_point(
+            self.mon_x + 1, self.mon_y + 1)
+        if self.gdk_mon:
+            LS.set_monitor(self, self.gdk_mon)
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.set_app_paintable(True)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.box.set_size_request(-1, BAR_HEIGHT)
+        self.add(self.box)
+        self.show_all()
 
 
 class Dock(Gtk.Window):
@@ -940,15 +1533,47 @@ class Dock(Gtk.Window):
         self.tray_apps = self.load_tray()
         self.tray_groups = {}
         self.tray_pop = None
-        self.tray_box = None
+        self.tray_menus = []       # DbusmenuGtk3 menus alive with the popup
+
+        self.popup_focus = None    # focused window when a popup opened
+
+        # internet + clock flyouts
+        self.net_win = None
+        self.net_timer = None
+        self.net = {}
+        self.net_public = None      # cached for the session
+        # throughput is sampled all session (one /proc read a second) so the
+        # flyout graph already has history when it opens
+        self.nstat = dict(live=[], buckets=[], span=1, cur=[0, 0, 0.0],
+                          last=None, start=time.time(), rx=0, tx=0)
+        self.net_view = 'session'
+        self._nstat_sample()
+        GLib.timeout_add_seconds(1, self._nstat_sample)
+        self.clk_win = None
+        self.clk_timer = None
+        self.clk = {}
+
+        # weather flyout
+        self.wx_win = None
+        self.wx_body = None
+        self.wx_fetching = False
+        self.wx_editing = False
+        self.wx_error = None
 
         # quick settings panel
         self.qs_win = None
         self.qs_panel = None
         self.qs_timer = None
         self.qs_setting = False   # guard: slider updated by code, not user
+        self.md = {}
+        self.md_pick = None       # chosen MPRIS player (sticky)
+        self.md_info = {}         # player -> identity / caps cache
+        self.md_timer = None
+        self.md_css = None
         self.qs_widgets = {}
         self.art_cache = {}       # url -> pixbuf
+        self.rgb_busy = False
+        self.rgb_error = ''
         self.night_step = self._night_load()
 
         # start menu (in-process, click-off backdrop)
@@ -1027,6 +1652,9 @@ class Dock(Gtk.Window):
         self.add(self.box)
 
         self.connect('destroy', Gtk.main_quit)
+        self.strips = [self]       # this dock + one MirrorStrip per extra monitor
+        self.preview_strip = None
+        self.sync_mirrors()
         self.listen_events()
         self.listen_ctrl()
         self.refresh()
@@ -1082,6 +1710,26 @@ class Dock(Gtk.Window):
             json.dump(self.tray_apps, f, indent=2)
 
     # ---------- hyprland events ----------
+    def sync_mirrors(self):
+        """One app strip per non-primary monitor (hotplug-aware)."""
+        mons = {m.get('name'): m for m in hyprctl('monitors', want_json=True) or []
+                if m.get('id') != self.mon_id and not m.get('disabled')}
+        for s in list(self.strips[1:]):
+            m = mons.pop(s.mon_name, None)
+            if m and (m.get('id'), m.get('x'), m.get('y'), m.get('width'),
+                      m.get('height')) == (s.mon_id, s.mon_x, s.mon_y,
+                                           s.mon_w, s.mon_h):
+                continue
+            if m:
+                mons[s.mon_name] = m       # geometry changed: rebuild it
+            if self.preview_strip is s:
+                self.close_preview()
+                self.preview_strip = None
+            self.strips.remove(s)
+            s.destroy()
+        for m in mons.values():
+            self.strips.append(MirrorStrip(m))
+
     def listen_events(self):
         sig = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')
         run = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
@@ -1105,9 +1753,15 @@ class Dock(Gtk.Window):
             line, self.evbuf = self.evbuf.split(b'\n', 1)
             ev = line.decode(errors='ignore')
             kind = ev.split('>>')[0]
-            if kind == 'activewindowv2':
+            if kind in ('monitoradded', 'monitorremoved',
+                        'monitoraddedv2', 'monitorremovedv2'):
+                GLib.timeout_add(500, lambda: (self.sync_mirrors(),
+                                               self.refresh(), False)[-1])
+            elif kind == 'activewindowv2':
                 addr = ev.split('>>', 1)[1].strip()
                 self.active_addr = ('0x' + addr) if addr and addr != ',' else None
+                if self.active_addr and self.active_addr != self.popup_focus:
+                    self.close_bar_popups()
                 self.schedule_thumb()
                 self.schedule_refresh()
             elif kind == 'closewindow':
@@ -1136,6 +1790,13 @@ class Dock(Gtk.Window):
                             aw = hyprctl('activewindow', want_json=True) or {}
                             active = norm_addr(aw.get('address'))
                         if active and addr != active:
+                            continue
+                        # Games (Rocket League) also fire minimize while still
+                        # focused (on ball/shot reset). Never honor those for
+                        # Steam games or fullscreen windows (no titlebar anyway).
+                        c = self._client(addr) or {}
+                        if ((c.get('class') or '').startswith('steam_app_')
+                                or int(c.get('fullscreen') or 0)):
                             continue
                         self.minimize_window(addr)
                     else:
@@ -1176,6 +1837,16 @@ class Dock(Gtk.Window):
             self.tray_toggle()
         elif cmd == 'quick':
             self.quick_toggle()
+        elif cmd == 'weather':
+            self.wx_toggle()
+        elif cmd == 'net':
+            self.net_toggle()
+        elif cmd == 'clock':
+            self.clk_toggle()
+        elif cmd == 'weather-location':
+            if not self.wx_win:
+                self.wx_toggle()
+            self.wx_start_edit()
         elif cmd == 'taskview':
             self.taskview_toggle()
         elif cmd == 'start':
@@ -1353,9 +2024,14 @@ class Dock(Gtk.Window):
                     m.get('y', 0) + m.get('height', 0) // 2)
         return None
 
-    def _backdrop(self, name, on_close, dim=False, layer=None):
+    def _backdrop(self, name, on_close, dim=False, layer=None,
+                  spare_bar=False, on_escape=None):
         """Fullscreen overlay window: clicking empty space or pressing
-        Esc closes it. Content decides its own alignment."""
+        Esc closes it. Content decides its own alignment.
+
+        spare_bar stops the backdrop above the taskbar strip, so bar
+        clicks reach waybar / the dock instead of only closing the popup.
+        Content anchored to the bottom then sits flush on the bar."""
         LS = GtkLayerShell
         w = Gtk.Window(title=name)
         LS.init_for_window(w)
@@ -1363,6 +2039,8 @@ class Dock(Gtk.Window):
         for e in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT):
             LS.set_anchor(w, e, True)
         LS.set_exclusive_zone(w, -1)   # cover the whole screen, bar included
+        if spare_bar:
+            LS.set_margin(w, LS.Edge.BOTTOM, BAR_HEIGHT)
         LS.set_namespace(w, name)
         if hasattr(LS, 'set_keyboard_mode'):
             LS.set_keyboard_mode(w, LS.KeyboardMode.ON_DEMAND)
@@ -1376,9 +2054,28 @@ class Dock(Gtk.Window):
                      | Gdk.EventMask.KEY_PRESS_MASK)
         w.connect('button-press-event', lambda _w, _e: (on_close(), True)[1])
         w.connect('key-press-event',
-                  lambda _w, e: ((on_close(), True)[1]
+                  lambda _w, e: (((on_escape or on_close)(), True)[1]
                                  if e.keyval == Gdk.KEY_Escape else False))
         return w
+
+    def close_bar_popups(self):
+        """Bar popups no longer cover the bar, so a bar click can land
+        while one is open: close them all before opening another, on dock
+        clicks, and when focus moves to a different window (e.g. a tray
+        icon raising its app)."""
+        if self.tray_pop:
+            self.tray_close()
+        if self.start_win:
+            self.start_close()
+        if self.qs_win:
+            self.quick_close()
+        if self.wx_win:
+            self.wx_close()
+        if self.net_win:
+            self.net_close()
+        if self.clk_win:
+            self.clk_close()
+        self.popup_focus = self.active_addr
 
     @staticmethod
     def _swallow_clicks(widget):
@@ -1414,61 +2111,264 @@ class Dock(Gtk.Window):
         if self.tray_pop:
             self.tray_pop.destroy()
             self.tray_pop = None
+        for m in self.tray_menus:
+            m.destroy()
+        self.tray_menus = []
+
+    # -- collapsed status-notifier icons (waybar tray → overflow) --
+    @staticmethod
+    def sni_hidden():
+        try:
+            with open(SNI_HIDDEN_FILE) as f:
+                ids = json.load(f)
+            return [i for i in ids if isinstance(i, str)]
+        except Exception:
+            return []
+
+    def sni_set_hidden(self, sni_id, hidden):
+        ids = self.sni_hidden()
+        if hidden == (sni_id in ids):
+            return
+        ids = ids + [sni_id] if hidden else [i for i in ids if i != sni_id]
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = SNI_HIDDEN_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(sorted(ids), f, indent=2)
+        os.replace(tmp, SNI_HIDDEN_FILE)   # waybar's file monitor picks it up
+
+    def sni_items(self):
+        """Collapsed tray items that are currently registered, in tray
+        order: dicts with id, title, bus, path, menu, is_menu, pixbuf."""
+        hidden = set(self.sni_hidden())
+        if not hidden:
+            return []
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            reg = bus.call_sync(
+                'org.kde.StatusNotifierWatcher', '/StatusNotifierWatcher',
+                'org.freedesktop.DBus.Properties', 'Get',
+                GLib.Variant('(ss)', ('org.kde.StatusNotifierWatcher',
+                                      'RegisteredStatusNotifierItems')),
+                None, Gio.DBusCallFlags.NONE, 300, None).unpack()[0]
+        except GLib.Error:
+            return []
+        items = []
+        for entry in reg:
+            # "service/path", or a bare service on the default path
+            slash = entry.find('/')
+            busname, path = ((entry[:slash], entry[slash:]) if slash > 0
+                             else (entry, '/StatusNotifierItem'))
+            try:
+                props = bus.call_sync(
+                    busname, path, 'org.freedesktop.DBus.Properties',
+                    'GetAll', GLib.Variant('(s)', ('org.kde.StatusNotifierItem',)),
+                    None, Gio.DBusCallFlags.NONE, 300, None).unpack()[0]
+            except GLib.Error:
+                continue
+            sid = props.get('Id') or ''
+            if sid not in hidden or props.get('Status', '').lower() == 'passive':
+                continue
+            tip = props.get('ToolTip')
+            title = (props.get('Title') or (tip[2] if tip else '') or sid)
+            items.append(dict(
+                id=sid, title=title, bus=busname, path=path,
+                menu=props.get('Menu') or '',
+                # libappindicator has no ItemIsMenu and only does menus
+                is_menu=props.get('ItemIsMenu', True),
+                pixbuf=self.sni_pixbuf(props, 24)))
+        return items
+
+    @staticmethod
+    def sni_pixbuf(props, size):
+        scale = 2   # crisp on HiDPI, downscaled by GtkImage otherwise fine
+        name = props.get('IconName') or ''
+        if name:
+            if name.startswith('/') and os.path.exists(name):
+                try:
+                    return GdkPixbuf.Pixbuf.new_from_file_at_size(name, size, size)
+                except GLib.Error:
+                    pass
+            theme = Gtk.IconTheme.get_default()
+            tpath = props.get('IconThemePath') or ''
+            if tpath:
+                theme = Gtk.IconTheme.new()
+                theme.prepend_search_path(tpath)
+            for t in (theme, Gtk.IconTheme.get_default()):
+                try:
+                    pb = t.load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+                    if pb:
+                        return pb
+                except GLib.Error:
+                    pass
+        pixmaps = props.get('IconPixmap') or []
+        if pixmaps:
+            # closest to the wanted size, preferring bigger
+            w, h, data = min(pixmaps, key=lambda p: (
+                p[0] < size * scale, abs(p[0] - size * scale)))
+            if w > 0 and h > 0 and len(data) >= w * h * 4:
+                argb = bytes(data[:w * h * 4])
+                rgba = bytearray(len(argb))   # network-order ARGB → RGBA
+                rgba[0::4], rgba[1::4] = argb[1::4], argb[2::4]
+                rgba[2::4], rgba[3::4] = argb[3::4], argb[0::4]
+                pb = GdkPixbuf.Pixbuf.new_from_bytes(
+                    GLib.Bytes.new(bytes(rgba)), GdkPixbuf.Colorspace.RGB,
+                    True, 8, w, h, w * 4)
+                return pb.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
+        return None
+
+    def sni_call(self, it, method, event):
+        x, y = (int(event.x_root), int(event.y_root)) if event else (0, 0)
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).call(
+            it['bus'], it['path'], 'org.kde.StatusNotifierItem', method,
+            GLib.Variant('(ii)', (x, y)), None, Gio.DBusCallFlags.NONE,
+            -1, None, None)
 
     def tray_toggle(self):
         if self.tray_pop:
             self.tray_close()
             return
+        self.close_bar_popups()
         self.groups = self.build_groups()   # freshen tray_groups
-        w = self._backdrop('winbar-tray', self.tray_close)
+        w = self._backdrop('winbar-tray', self.tray_close,
+                           spare_bar=True)
 
-        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        panel.get_style_context().add_class('previewcard')
-        panel.set_halign(Gtk.Align.END)
-        panel.set_valign(Gtk.Align.END)
-        panel.set_margin_end(150)
-        panel.set_margin_bottom(BAR_HEIGHT + 8)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class('wxcard')
+        card.set_halign(Gtk.Align.END)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_bottom(8)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         for m in ('top', 'bottom', 'start', 'end'):
-            getattr(inner, f'set_margin_{m}')(8)
+            getattr(body, f'set_margin_{m}')(6)
 
-        if self.tray_groups:
+        # one grid: collapsed tray icons first, then hide-to-tray apps
+        tiles = []
+        for it in self.sni_items():
+            img = (Gtk.Image.new_from_pixbuf(it['pixbuf']) if it['pixbuf']
+                   else Gtk.Image.new_from_icon_name(
+                       'application-x-executable', Gtk.IconSize.LARGE_TOOLBAR))
+            if it['menu'] and DbusmenuGtk3:
+                # built now so the async layout is in by the time it's opened
+                m = DbusmenuGtk3.Menu.new(it['bus'], it['menu'])
+                self.tray_menus.append(m)
+                it['gtkmenu'] = m
+            tiles.append((img, it['title'], ('sni', it)))
+        for k, g in self.tray_groups.items():
+            name = (g['info'].get_display_name() if g['info']
+                    else (g['cls'] or '?'))
+            n = len(g['windows'])
+            tiles.append((self.icon_image(g, 24),
+                          f"{name} — {n} window{'s' if n > 1 else ''}",
+                          ('app', (k, g))))
+
+        if tiles:
             fb = Gtk.FlowBox()
             fb.set_selection_mode(Gtk.SelectionMode.NONE)
-            fb.set_max_children_per_line(4)
-            fb.set_min_children_per_line(min(4, len(self.tray_groups)))
-            for k, g in self.tray_groups.items():
+            fb.set_homogeneous(True)
+            fb.set_column_spacing(2)
+            fb.set_row_spacing(2)
+            cols = min(4, len(tiles))
+            fb.set_max_children_per_line(cols)
+            fb.set_min_children_per_line(cols)
+            for img, tip, (kind, ref) in tiles:
                 b = Gtk.Button()
                 b.get_style_context().add_class('traybtn')
                 b.set_relief(Gtk.ReliefStyle.NONE)
-                b.add(self.icon_image(g, 24))
-                name = (g['info'].get_display_name() if g['info']
-                        else (g['cls'] or '?'))
-                n = len(g['windows'])
-                b.set_tooltip_text(
-                    f"{name} — {n} window{'s' if n > 1 else ''}")
-                b._group = g
-                b._key = k
-                b.connect('button-press-event', self.on_tray_press)
+                b.set_focus_on_click(False)
+                img.set_pixel_size(24)
+                b.add(img)
+                b.set_tooltip_text(tip)
+                b.connect('button-press-event',
+                          self.on_sni_press if kind == 'sni'
+                          else self.on_tray_press, ref)
                 fb.add(b)
-            inner.pack_start(fb, False, False, 0)
+            body.pack_start(fb, False, False, 0)
         else:
-            lbl = Gtk.Label(label='No tray apps running')
-            lbl.get_style_context().add_class('traylabel')
-            for m in ('top', 'bottom', 'start', 'end'):
-                getattr(lbl, f'set_margin_{m}')(8)
-            inner.pack_start(lbl, False, False, 0)
+            lbl = self._lbl('No hidden icons', 'traylabel', 0.5)
+            lbl.set_margin_top(6)
+            lbl.set_margin_bottom(6)
+            body.pack_start(lbl, False, False, 0)
+        card.pack_start(body, False, False, 0)
 
-        panel.add(inner)
-        w.add(self._swallow_clicks(panel))
+        w.add(self._swallow_clicks(card))
         gm = self._cursor_gdk_mon()
         if gm:
             GtkLayerShell.set_monitor(w, gm)
+        card.set_margin_end(self._tray_margin(card, gm))
         self.tray_pop = w
         w.show_all()
 
-    def on_tray_press(self, btn, event):
-        g = btn._group
+    def _tray_margin(self, card, gm):
+        """Centre the card over the chevron: the popup is opened by clicking
+        it, so the cursor is there. Waybar's tray width varies with how many
+        icons are showing, so a fixed offset drifts."""
+        try:
+            x, y = [int(v.strip()) for v in hyprctl('cursorpos').split(',')]
+            geo = gm.get_geometry()
+            if y < geo.y + geo.height - BAR_HEIGHT - 4:
+                raise ValueError('not opened from the bar')
+            card.show_all()
+            width = max(card.get_preferred_width()[1], 1)
+            right = geo.x + geo.width - x - width // 2
+            return max(8, min(right, geo.width - width - 8))
+        except Exception:
+            return 150
+
+    def _menu_extra(self, menu, label, cb):
+        """Append our own entry to an app's (dbus) menu for one popup,
+        then take it back out — the menu is reused for left clicks."""
+        extra = []
+        if menu.get_children():
+            extra.append(Gtk.SeparatorMenuItem())
+        mi = Gtk.MenuItem(label=label)
+        mi.connect('activate',
+                   lambda *_: GLib.idle_add(lambda: (cb(), False)[1]))
+        extra.append(mi)
+        for e in extra:
+            menu.append(e)
+            e.show()
+
+        def done(*_):
+            menu.disconnect(sig)
+            # idle: GTK hides the menu before it emits the item's activate
+            GLib.idle_add(lambda: [menu.remove(e) for e in extra
+                                   if e.get_parent() is menu] and False)
+        sig = menu.connect('hide', done)
+
+    def on_sni_press(self, btn, event, it):
+        menu = it.get('gtkmenu')
+        if event.button == 1 and not it['is_menu']:
+            self.sni_call(it, 'Activate', event)
+            self.tray_close()
+            return True
+        if event.button == 2:
+            self.sni_call(it, 'SecondaryActivate', event)
+            self.tray_close()
+            return True
+        if event.button in (1, 3):
+            if event.button == 3:
+                if menu is None:
+                    menu = Gtk.Menu()
+                    self.tray_menus.append(menu)
+                    mi = Gtk.MenuItem(label='App menu')
+                    mi.connect('activate',
+                               lambda *_: self.sni_call(it, 'ContextMenu', None))
+                    menu.append(mi)
+                    it['gtkmenu'] = menu
+                self._menu_extra(menu, 'Show in taskbar', lambda: (
+                    self.sni_set_hidden(it['id'], False), self.tray_close()))
+            if menu is None:
+                self.sni_call(it, 'ContextMenu', event)
+                self.tray_close()
+                return True
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        return False
+
+    def on_tray_press(self, btn, event, ref):
+        key, g = ref
         if event.button == 1:
             self.tray_close()
             # Anki lives on special:anki — open it on the *current* workspace
@@ -1483,7 +2383,7 @@ class Dock(Gtk.Window):
         if event.button == 3:
             menu = Gtk.Menu()
             mi = Gtk.MenuItem(label='Show in taskbar')
-            mi.connect('activate', lambda _m, k=btn._key: self.tray_untag(k))
+            mi.connect('activate', lambda _m, k=key: self.tray_untag(k))
             menu.append(mi)
             if g['info']:
                 mi = Gtk.MenuItem(label='Open new window')
@@ -1544,9 +2444,11 @@ class Dock(Gtk.Window):
         if self.start_win:
             self.start_close()
             return
+        self.close_bar_popups()
         self.st = {}
         self.start_pinned = self.load_start_pinned()
-        w = self._backdrop('winbar-start', self.start_close)
+        w = self._backdrop('winbar-start', self.start_close,
+                           spare_bar=True)
         # EXCLUSIVE (not ON_DEMAND): the menu opens from a taskbar click,
         # so it has to take the keyboard itself or search can't be typed.
         if hasattr(GtkLayerShell, 'set_keyboard_mode'):
@@ -1558,7 +2460,7 @@ class Dock(Gtk.Window):
         card.set_halign(Gtk.Align.START)
         card.set_valign(Gtk.Align.END)
         card.set_margin_start(10)
-        card.set_margin_bottom(BAR_HEIGHT + 8)
+        card.set_margin_bottom(8)
         # fixed size, like the real thing: the body scrolls instead of the
         # menu resizing itself as you type
         card.set_size_request(START_W, START_H)
@@ -2183,6 +3085,9 @@ class Dock(Gtk.Window):
         if self.qs_timer:
             GLib.source_remove(self.qs_timer)
             self.qs_timer = None
+        if self.md_timer:
+            GLib.source_remove(self.md_timer)
+            self.md_timer = None
         if self.qs_win:
             self.qs_win.destroy()
             self.qs_win = None
@@ -2192,27 +3097,36 @@ class Dock(Gtk.Window):
         if self.qs_win:
             self.quick_close()
             return
-        w = self._backdrop('winbar-quick', self.quick_close)
+        self.close_bar_popups()
+        w = self._backdrop('winbar-quick', self.quick_close,
+                           spare_bar=True)
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        card.get_style_context().add_class('previewcard')
+        card.get_style_context().add_class('qscard')
         card.set_halign(Gtk.Align.END)
         card.set_valign(Gtk.Align.END)
         card.set_margin_end(10)
-        card.set_margin_bottom(BAR_HEIGHT + 8)
-        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        v.set_size_request(340, -1)
+        card.set_margin_bottom(8)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        v.set_size_request(QS_W, -1)
         for m in ('top', 'bottom', 'start', 'end'):
-            getattr(v, f'set_margin_{m}')(14)
+            getattr(v, f'set_margin_{m}')(10)
 
         media = self.qs_media_section()
         if media:
             v.pack_start(media, False, False, 0)
-            v.pack_start(
-                Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL),
-                False, False, 0)
-        v.pack_start(self.qs_volume_row(), False, False, 0)
-        v.pack_start(self.qs_toggle_row(), False, False, 0)
+            # album art backdrop spans the whole panel, under the CSS
+            # background (made transparent while there is art)
+            self.qs_widgets['qs_card'] = card
+            card.connect('draw', self._md_draw_bg)
+        ctl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ('start', 'end'):
+            getattr(ctl, f'set_margin_{m}')(6)
+        ctl.set_margin_bottom(4)
+        ctl.set_margin_top(0 if media else 6)
+        v.pack_start(ctl, False, False, 0)
+        ctl.pack_start(self.qs_volume_row(), False, False, 0)
+        ctl.pack_start(self.qs_toggle_row(), False, False, 0)
 
         card.add(v)
         w.add(self._swallow_clicks(card))
@@ -2249,53 +3163,624 @@ class Dock(Gtk.Window):
                 return p
         return players[0] if players else None
 
+    # ----- media card (quick settings) -----
+    # Album art drives the look: a blurred copy fills the card, and
+    # the art's most vivid color tints the play button and seek bar.
+    # The seek bar runs off a local clock between playerctl polls, so
+    # it moves smoothly and stays drag-seekable.
+    @staticmethod
+    def _md_players():
+        try:
+            names = subprocess.run(['playerctl', '-l'], capture_output=True,
+                                   text=True, timeout=2).stdout.split()
+        except Exception:
+            return []
+        playing = []
+        for p in names:
+            try:
+                st = subprocess.run(['playerctl', '-p', p, 'status'],
+                                    capture_output=True, text=True,
+                                    timeout=2).stdout.strip()
+            except Exception:
+                st = ''
+            playing.append(st == 'Playing')
+        return [p for _, p in sorted(zip(playing, names),
+                                     key=lambda t: not t[0])]
+
+    def _md_info(self, player):
+        """(identity, desktop entry, can shuffle, can loop), cached."""
+        if player in self.md_info:
+            return self.md_info[player]
+        ident, desk = '', ''
+        try:
+            out = subprocess.run(
+                ['busctl', '--user', 'get-property',
+                 f'org.mpris.MediaPlayer2.{player}', '/org/mpris/MediaPlayer2',
+                 'org.mpris.MediaPlayer2', 'Identity', 'DesktopEntry'],
+                capture_output=True, text=True, timeout=2).stdout
+            vals = re.findall(r'^s "(.*)"$', out, re.M)
+            ident = vals[0] if vals else ''
+            desk = vals[1] if len(vals) > 1 else ''
+        except Exception:
+            pass
+
+        def can(cmd):
+            try:
+                return subprocess.run(['playerctl', '-p', player, cmd],
+                                      capture_output=True,
+                                      timeout=2).returncode == 0
+            except Exception:
+                return False
+        ident = re.sub(r'^Mozilla\s+', '', ident) or player.split('.')[0]
+        info = (ident[:1].upper() + ident[1:], desk, can('shuffle'),
+                can('loop'))
+        self.md_info[player] = info
+        return info
+
     def qs_media_section(self):
-        player = self._player()
-        if not player:
+        players = self._md_players()
+        if not players:
             return None
-        self.qs_widgets['player'] = player
+        if self.md_pick not in players:
+            self.md_pick = players[0]
+        self.md = {'players': players, 'pos': 0.0, 'len': 0.0,
+                   'playing': False, 'sync': time.monotonic(),
+                   'seek': None, 'hover': False, 'art_key': None,
+                   'art': None, 'blur': None, 'color': self._md_default_rgb()}
+        self.qs_widgets['player'] = self.md_pick
+        W = self.qs_widgets
 
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        art = Gtk.Image()
-        art.set_size_request(56, 56)
-        art.get_style_context().add_class('qsart')
-        box.pack_start(art, False, False, 0)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.get_style_context().add_class('mdcard')
 
-        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        mid.set_valign(Gtk.Align.CENTER)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ('top', 'bottom', 'start', 'end'):
+            getattr(inner, f'set_margin_{m}')(14)
+        card.pack_start(inner, True, True, 0)
+
+        # source row: app · switcher · open
+        src = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        icon = Gtk.Image()
+        src.pack_start(icon, False, False, 0)
+        name = Gtk.Label(label='')
+        name.get_style_context().add_class('mdsrc')
+        src.pack_start(name, False, False, 0)
+        state = Gtk.Label(label='')
+        state.get_style_context().add_class('mdstate')
+        src.pack_start(state, False, False, 0)
+        raise_b = self._md_btn('\U000F03CC', 'mdmini', self._md_raise)
+        raise_b.set_tooltip_text('Show player')
+        src.pack_end(raise_b, False, False, 0)
+        if len(players) > 1:
+            nxt = self._md_btn('\U000F0142', 'mdmini',
+                               lambda *_: self._md_switch(1))
+            cnt = Gtk.Label(label='')
+            cnt.get_style_context().add_class('mdstate')
+            prv = self._md_btn('\U000F0141', 'mdmini',
+                               lambda *_: self._md_switch(-1))
+            for b in (nxt, cnt, prv):
+                src.pack_end(b, False, False, 0)
+            W['md_count'] = cnt
+        inner.pack_start(src, False, False, 0)
+
+        # art + text
+        mid = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        art = Gtk.DrawingArea()
+        art.set_size_request(MD_ART, MD_ART)
+        art.connect('draw', self._md_draw_art)
+        mid.pack_start(art, False, False, 0)
+        txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        txt.set_valign(Gtk.Align.CENTER)
         title = Gtk.Label(label='—')
-        title.get_style_context().add_class('qstitle')
-        title.set_halign(Gtk.Align.START)
+        title.get_style_context().add_class('mdtitle')
+        title.set_xalign(0)
+        title.set_line_wrap(True)
+        title.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        title.set_lines(2)
         title.set_ellipsize(Pango.EllipsizeMode.END)
-        title.set_max_width_chars(18)
+        title.set_max_width_chars(22)
         artist = Gtk.Label(label='')
-        artist.get_style_context().add_class('qsdim')
-        artist.set_halign(Gtk.Align.START)
-        artist.set_ellipsize(Pango.EllipsizeMode.END)
-        artist.set_max_width_chars(20)
-        mid.pack_start(title, False, False, 0)
-        mid.pack_start(artist, False, False, 0)
-        box.pack_start(mid, True, True, 0)
+        artist.get_style_context().add_class('mdartist')
+        album = Gtk.Label(label='')
+        album.get_style_context().add_class('mdalbum')
+        for l in (artist, album):
+            l.set_xalign(0)
+            l.set_ellipsize(Pango.EllipsizeMode.END)
+            l.set_max_width_chars(24)
+        for l in (title, artist, album):
+            txt.pack_start(l, False, False, 0)
+        mid.pack_start(txt, True, True, 0)
+        inner.pack_start(mid, False, False, 0)
 
-        ctr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        ctr.set_valign(Gtk.Align.CENTER)
-        for glyph, act in (('󰒮', 'previous'),
-                           ('󰐊', 'play-pause'),
-                           ('󰒭', 'next')):
-            b = self._qsbtn(glyph, lambda _b, a=act: self._media_cmd(a))
-            if act == 'play-pause':
-                self.qs_widgets['play'] = b
+        # seek bar + times
+        seek = Gtk.DrawingArea()
+        seek.set_size_request(-1, 16)
+        seek.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                        | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK
+                        | Gdk.EventMask.ENTER_NOTIFY_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        seek.connect('draw', self._md_draw_seek)
+        seek.connect('button-press-event', self._md_seek_press)
+        seek.connect('motion-notify-event', self._md_seek_motion)
+        seek.connect('button-release-event', self._md_seek_release)
+        seek.connect('enter-notify-event', lambda w, _e: (
+            self.md.__setitem__('hover', True), w.queue_draw()))
+        seek.connect('leave-notify-event', lambda w, _e: (
+            self.md.__setitem__('hover', False), w.queue_draw()))
+        times = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        times.set_margin_start(5)
+        times.set_margin_end(5)
+        t_el = Gtk.Label(label='0:00')
+        t_rem = Gtk.Label(label='')
+        for l in (t_el, t_rem):
+            l.get_style_context().add_class('mdtime')
+        times.pack_start(t_el, False, False, 0)
+        times.pack_end(t_rem, False, False, 0)
+        sk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sk.pack_start(seek, False, False, 0)
+        sk.pack_start(times, False, False, 0)
+        inner.pack_start(sk, False, False, 0)
+
+        # transport
+        ctr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        ctr.set_halign(Gtk.Align.CENTER)
+        shuf = self._md_btn('\U000F049D', 'mdside',
+                            lambda *_: self._md_cmd('shuffle', 'Toggle'))
+        shuf.set_tooltip_text('Shuffle')
+        prev = self._md_btn('\U000F04AE', 'mdskip',
+                            lambda *_: self._md_cmd('previous'))
+        play = self._md_btn('\U000F040A', 'mdplay',
+                            lambda *_: self._md_cmd('play-pause'))
+        nxt = self._md_btn('\U000F04AD', 'mdskip',
+                           lambda *_: self._md_cmd('next'))
+        loop = self._md_btn('\U000F0456', 'mdside', self._md_cycle_loop)
+        loop.set_tooltip_text('Repeat')
+        for b in (shuf, prev, play, nxt, loop):
+            b.set_valign(Gtk.Align.CENTER)
             ctr.pack_start(b, False, False, 0)
-        box.pack_start(ctr, False, False, 0)
+        inner.pack_start(ctr, False, False, 0)
 
-        self.qs_widgets.update(art=art, title=title, artist=artist)
-        return box
+        W.update(md_card=card, md_icon=icon, md_name=name, md_state=state,
+                 md_art=art, title=title, artist=artist, album=album,
+                 md_seek=seek, md_el=t_el, md_rem=t_rem, play=play,
+                 md_shuf=shuf, md_loop=loop, md_prev=prev, md_next=nxt)
+        self._md_apply_player()
+        self.md_timer = GLib.timeout_add(200, self._md_tick)
+        return card
 
-    def _media_cmd(self, action):
-        p = self.qs_widgets.get('player')
-        if p:
-            subprocess.Popen(['playerctl', '-p', p, action])
-            GLib.timeout_add(250, self.qs_update)
+    def _md_btn(self, glyph, cls, cb):
+        b = Gtk.Button(label=glyph)
+        b.get_style_context().add_class('mdbtn')
+        b.get_style_context().add_class(cls)
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.connect('clicked', cb)
+        return b
+
+    def _md_apply_player(self):
+        W = self.qs_widgets
+        p = self.md_pick
+        ident, desk, can_shuf, can_loop = self._md_info(p)
+        W['md_name'].set_label(ident)
+        gicon = None
+        if desk:
+            info = desktop_info(desk + '.desktop')
+            gicon = info.get_icon() if info else None
+        if gicon:
+            W['md_icon'].set_from_gicon(gicon, Gtk.IconSize.MENU)
+            W['md_icon'].set_pixel_size(16)
+            W['md_icon'].show()
+        else:
+            W['md_icon'].hide()
+        W['md_shuf'].set_visible(can_shuf)
+        W['md_loop'].set_visible(can_loop)
+        W['md_shuf'].set_no_show_all(not can_shuf)
+        W['md_loop'].set_no_show_all(not can_loop)
+        if 'md_count' in W:
+            pl = self.md['players']
+            W['md_count'].set_label(f'{pl.index(p) + 1}/{len(pl)}')
+        self.md.update(art_key=None, art=None, blur=None,
+                       color=self._md_default_rgb())
+        self._md_restyle()
+        self._md_redraw()
+
+    def _md_switch(self, step):
+        pl = self.md['players']
+        self.md_pick = pl[(pl.index(self.md_pick) + step) % len(pl)]
+        self.qs_widgets['player'] = self.md_pick
+        self._md_apply_player()
+        self.qs_update()
+
+    def _md_cmd(self, *args):
+        p = self.md_pick
+        if not p:
+            return
+        subprocess.Popen(['playerctl', '-p', p, *args])
+        if args[0] == 'play-pause':   # feel instant; the poll confirms
+            self.md['playing'] = not self.md['playing']
+            self.md['sync'] = time.monotonic()
+            self._md_paint_state()
+        GLib.timeout_add(250, self.qs_update)
+
+    def _md_cycle_loop(self, *_):
+        nxt = {'None': 'Playlist', 'Playlist': 'Track'}.get(
+            self.md.get('loop', 'None'), 'None')
+        self._md_cmd('loop', nxt)
+
+    def _md_raise(self, *_):
+        _, desk, _, _ = self._md_info(self.md_pick)
+        want = {x.lower() for x in (desk, self.md_pick.split('.')[0]) if x}
+        for c in hyprctl('clients', want_json=True) or []:
+            cls = {(c.get('class') or '').lower(),
+                   (c.get('initialClass') or '').lower()}
+            if want & cls:
+                addr = c['address']
+                if is_minimized_ws(c.get('workspace')):
+                    self.toggle_minimize(addr)
+                dispatch('focuswindow', f'address:{addr}')
+                dispatch('alterzorder', f'top,address:{addr}')
+                break
+        self.quick_close()
+
+    def _md_update(self):
+        W = self.qs_widgets
+        p = self.md_pick
+        if not p or 'md_card' not in W:
+            return
+        fmt = '\x1f'.join(('{{status}}', '{{title}}', '{{artist}}',
+                           '{{album}}', '{{mpris:artUrl}}', '{{xesam:url}}',
+                           '{{position}}', '{{mpris:length}}',
+                           '{{shuffle}}', '{{loop}}'))
+        try:
+            out = subprocess.run(
+                ['playerctl', '-p', p, 'metadata', '--format', fmt],
+                capture_output=True, text=True, timeout=2).stdout.rstrip('\n')
+        except Exception:
+            return
+        f = (out.split('\x1f') + [''] * 10)[:10]
+        status, title, artist, album, art_url, url, pos, length, shuf, loop = f
+        if not out:
+            W['md_state'].set_label('·  Nothing playing')
+            return
+        W['title'].set_label(title or 'Unknown title')
+        W['title'].set_tooltip_text(title or None)
+        artist = re.sub(r'\s+-\s+Topic$', '', artist)
+        W['artist'].set_label(artist)
+        W['artist'].set_visible(bool(artist))
+        W['album'].set_label(album)
+        W['album'].set_visible(bool(album) and album != title)
+
+        md = self.md
+        md['playing'] = status == 'Playing'
+        md['status'] = status
+        try:
+            md['len'] = int(length) / 1e6 if length else 0.0
+        except ValueError:
+            md['len'] = 0.0
+        if md['seek'] is None:
+            try:
+                md['pos'] = int(pos) / 1e6
+            except ValueError:
+                md['pos'] = 0.0
+            md['sync'] = time.monotonic()
+        md['shuffle'] = shuf == 'true'
+        md['loop'] = loop or 'None'
+        self._md_paint_state()
+
+        if not art_url:
+            m = re.search(r'(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/)'
+                          r'([\w-]{11})', url or '')
+            if m:
+                art_url = f'https://i.ytimg.com/vi/{m.group(1)}/mqdefault.jpg'
+        self.qs_set_art(art_url)
+
+    def _md_paint_state(self):
+        W, md = self.qs_widgets, self.md
+        W['play'].set_label('\U000F03E4' if md['playing'] else '\U000F040A')
+        W['md_state'].set_label(
+            '' if md['playing'] else
+            '·  ' + (md.get('status') or 'Paused'))
+        for key, on in (('md_shuf', md.get('shuffle')),
+                        ('md_loop', md.get('loop', 'None') != 'None')):
+            ctx = W[key].get_style_context()
+            ctx.add_class('on') if on else ctx.remove_class('on')
+        W['md_loop'].set_label('\U000F0458' if md.get('loop') == 'Track'
+                               else '\U000F0456')
+        self._md_paint_time()
+        W['md_seek'].queue_draw()
+
+    def _md_now(self):
+        md = self.md
+        if md['seek'] is not None:
+            return md['seek'] * md['len']
+        pos = md['pos']
+        if md['playing']:
+            pos += time.monotonic() - md['sync']
+        return min(pos, md['len']) if md['len'] else pos
+
+    @staticmethod
+    def _md_fmt(sec):
+        sec = max(0, int(sec))
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
+
+    def _md_paint_time(self):
+        W = self.qs_widgets
+        now, length = self._md_now(), self.md['len']
+        W['md_el'].set_label(self._md_fmt(now))
+        W['md_rem'].set_label('-' + self._md_fmt(length - now)
+                              if length else '')
+
+    def _md_tick(self):
+        if not self.qs_win or 'md_seek' not in self.qs_widgets:
+            self.md_timer = None
+            return False
+        if self.md['playing'] or self.md['seek'] is not None:
+            self._md_paint_time()
+            self.qs_widgets['md_seek'].queue_draw()
+        return True
+
+    # seek bar
+    def _md_frac(self, w, x):
+        pad = 7
+        return min(1.0, max(0.0, (x - pad) / max(1, w.get_allocated_width()
+                                                 - 2 * pad)))
+
+    def _md_seek_press(self, w, ev):
+        if ev.button != 1 or not self.md['len']:
+            return False
+        self.md['seek'] = self._md_frac(w, ev.x)
+        w.queue_draw()
+        self._md_paint_time()
+        return True
+
+    def _md_seek_motion(self, w, ev):
+        if self.md['seek'] is not None:
+            self.md['seek'] = self._md_frac(w, ev.x)
+            w.queue_draw()
+            self._md_paint_time()
+        return True
+
+    def _md_seek_release(self, w, ev):
+        md = self.md
+        if md['seek'] is None:
+            return False
+        target = md['seek'] * md['len']
+        md.update(seek=None, pos=target, sync=time.monotonic())
+        subprocess.Popen(['playerctl', '-p', self.md_pick, 'position',
+                          f'{target:.2f}'])
+        w.queue_draw()
+        self._md_paint_time()
+        return True
+
+    @staticmethod
+    def _md_rrect(cr, x, y, w, h, r):
+        import math
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def _md_draw_seek(self, w, cr):
+        import math
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        pad, th = 7, 4
+        active = self.md['hover'] or self.md['seek'] is not None
+        if active:
+            th = 6
+        y = (H - th) / 2
+        length = self.md['len']
+        frac = (self._md_now() / length) if length else 0
+        r, g, b = self.md['color']
+        self._md_rrect(cr, pad, y, W - 2 * pad, th, th / 2)
+        cr.set_source_rgba(1, 1, 1, 0.18)
+        cr.fill()
+        fw = (W - 2 * pad) * frac
+        if fw > 0.5:
+            self._md_rrect(cr, pad, y, max(fw, th), th, th / 2)
+            cr.set_source_rgb(r, g, b)
+            cr.fill()
+        if active and length:
+            cr.arc(pad + fw, H / 2, 7, 0, 2 * math.pi)
+            cr.set_source_rgb(1, 1, 1)
+            cr.fill()
+        return False
+
+    def _md_draw_art(self, w, cr):
+        import cairo
+        S = MD_ART
+        self._md_rrect(cr, 0, 0, S, S, 10)
+        art = self.md.get('art')
+        if art:
+            cr.save()
+            cr.clip()
+            sw, sh = art.get_width(), art.get_height()
+            sc = S / min(sw, sh)
+            cr.scale(sc, sc)
+            Gdk.cairo_set_source_pixbuf(cr, art, (S / sc - sw) / 2,
+                                        (S / sc - sh) / 2)
+            cr.get_source().set_filter(cairo.FILTER_BEST)
+            cr.paint()
+            cr.restore()
+        else:
+            r, g, b = self.md['color']
+            grad = cairo.LinearGradient(0, 0, S, S)
+            grad.add_color_stop_rgba(0, r, g, b, 0.85)
+            grad.add_color_stop_rgba(1, r * 0.35, g * 0.35, b * 0.35, 0.95)
+            cr.set_source(grad)
+            cr.fill()
+            cr.select_font_face('Commit Mono Nerd Font')
+            cr.set_font_size(38)
+            glyph = '\U000F075A'
+            ext = cr.text_extents(glyph)
+            cr.move_to((S - ext.width) / 2 - ext.x_bearing,
+                       (S - ext.height) / 2 - ext.y_bearing)
+            cr.set_source_rgba(1, 1, 1, 0.9)
+            cr.show_text(glyph)
+        # hairline edge so dark covers don't melt into the card
+        self._md_rrect(cr, 0.5, 0.5, S - 1, S - 1, 10)
+        cr.set_source_rgba(1, 1, 1, 0.10)
+        cr.set_line_width(1)
+        cr.stroke()
+        return False
+
+    def _md_draw_bg(self, w, cr):
+        import cairo
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        R = 14
+        self._md_rrect(cr, 0, 0, W, H, R)
+        cr.save()
+        cr.clip_preserve()
+        blur = self.md.get('blur')
+        r, g, b = self.md['color']
+        if not blur:      # plain acrylic (CSS) with a faint accent wash
+            cr.restore()
+            cr.new_path()
+            return False
+        if blur:
+            bw, bh = blur.get_width(), blur.get_height()
+            sc = max(W / bw, H / bh)
+            cr.save()
+            cr.scale(sc, sc)
+            Gdk.cairo_set_source_pixbuf(cr, blur, (W / sc - bw) / 2,
+                                        (H / sc - bh) / 2)
+            cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+            cr.paint()
+            cr.restore()
+            shade = cairo.LinearGradient(0, 0, 0, H)
+            # bright covers need more shade to keep white text legible
+            px = blur.scale_simple(1, 1, GdkPixbuf.InterpType.BILINEAR)
+            lum = sum(px.get_pixels()[:3]) / 765
+            base = 0.38 + 0.30 * lum
+            shade.add_color_stop_rgba(0, 0.04, 0.04, 0.06, base)
+            shade.add_color_stop_rgba(0.55, 0.04, 0.04, 0.06, base + 0.12)
+            shade.add_color_stop_rgba(1, 0.04, 0.04, 0.06, base + 0.26)
+            cr.set_source(shade)
+            cr.paint()
+        else:
+            grad = cairo.LinearGradient(0, 0, W, H)
+            grad.add_color_stop_rgba(0, r, g, b, 0.30)
+            grad.add_color_stop_rgba(1, r, g, b, 0.06)
+            cr.set_source(grad)
+            cr.paint()
+        cr.restore()
+        cr.new_path()
+        return False
+
+    # colors
+    @staticmethod
+    def _md_default_rgb():
+        hexcol = wallpaper_accent() or '#6cb8ff'
+        return tuple(int(hexcol[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+    def _md_restyle(self):
+        """Tint play button + toggles with the current art color."""
+        import colorsys
+        r, g, b = self.md['color']
+        h, l, s = colorsys.rgb_to_hls(r, g, b)
+        fg = '#101216' if l > 0.55 else '#ffffff'
+        R, G, B = (round(c * 255) for c in (r, g, b))
+        css = f"""
+button.mdplay {{ background: rgb({R},{G},{B}); color: {fg}; }}
+button.mdplay:hover {{ background: rgba({R},{G},{B},0.85); }}
+button.mdside.on {{ color: rgb({R},{G},{B}); }}
+.qscard.hasart {{ background: transparent; }}
+.qscard.hasart scale highlight {{ background: rgb({R},{G},{B}); }}
+.qscard.hasart .qsbtn.on {{ background: rgb({R},{G},{B}); color: {fg}; }}
+""".encode()
+        if self.md_css is None:
+            self.md_css = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), self.md_css,
+                Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        self.md_css.load_from_data(css)
+
+    @staticmethod
+    def _md_vivid(pix):
+        """Most vivid color in a tiny thumbnail, lifted to read on dark."""
+        import colorsys
+        t = pix.scale_simple(12, 12, GdkPixbuf.InterpType.BILINEAR)
+        data, n, rs = t.get_pixels(), t.get_n_channels(), t.get_rowstride()
+        best, best_score = (0.6, 0.7, 1.0), -1
+        for y in range(12):
+            for x in range(12):
+                i = y * rs + x * n
+                r, g, b = (data[i + k] / 255 for k in range(3))
+                h, s, v = colorsys.rgb_to_hsv(r, g, b)
+                score = s * v * (0.4 + v)
+                if score > best_score:
+                    best_score, best = score, (h, s, v)
+        h, s, v = best
+        if s < 0.12:          # greyscale cover: stay neutral but bright
+            return (0.88, 0.88, 0.90)
+        return colorsys.hsv_to_rgb(h, min(max(s, 0.45), 0.75),
+                                   max(v, 0.85))
+
+    def qs_set_art(self, url):
+        if self.md.get('art_key') == (self.md_pick, url):
+            return
+        self.md['art_key'] = (self.md_pick, url)
+        if not url:
+            self.md.update(art=None, blur=None, color=self._md_default_rgb())
+            self._md_restyle()
+            self._md_redraw()
+            return
+        if url.startswith('file://'):
+            try:
+                self._apply_art(GLib.filename_from_uri(url)[0], url)
+            except Exception:
+                pass
+        elif url.startswith('http'):
+            os.makedirs(ART_DIR, exist_ok=True)
+            dest = os.path.join(
+                ART_DIR, hashlib.sha1(url.encode()).hexdigest())
+            if os.path.exists(dest):
+                self._apply_art(dest, url)
+            else:
+                def dl():
+                    try:
+                        tmp = dest + '.part'
+                        urllib.request.urlretrieve(url, tmp)
+                        os.replace(tmp, dest)
+                        GLib.idle_add(self._apply_art, dest, url)
+                    except Exception:
+                        pass
+                threading.Thread(target=dl, daemon=True).start()
+
+    def _apply_art(self, path, url=None):
+        if not self.qs_win or 'md_art' not in self.qs_widgets:
+            return False
+        if url is not None and self.md.get('art_key') != (self.md_pick, url):
+            return False      # track changed while downloading
+        try:
+            pix = GdkPixbuf.Pixbuf.new_from_file(path)
+        except Exception:
+            return False
+        side = min(pix.get_width(), pix.get_height())
+        sq = pix.new_subpixbuf((pix.get_width() - side) // 2,
+                               (pix.get_height() - side) // 2, side, side)
+        art = sq.scale_simple(MD_ART * 2, MD_ART * 2,
+                              GdkPixbuf.InterpType.HYPER)
+        # cheap, soft blur: crush to a few pixels then smooth back up
+        tiny = sq.scale_simple(8, 8, GdkPixbuf.InterpType.HYPER)
+        blur = tiny.scale_simple(40, 40, GdkPixbuf.InterpType.BILINEAR)
+        self.md.update(art=art, blur=blur, color=self._md_vivid(sq))
+        self._md_restyle()
+        self._md_redraw()
+        return False
+
+    def _md_redraw(self):
+        card = self.qs_widgets.get('qs_card')
+        if card:
+            ctx = card.get_style_context()
+            ctx.add_class('hasart') if self.md.get('blur') \
+                else ctx.remove_class('hasart')
+        for k in ('qs_card', 'md_art', 'md_seek'):
+            if k in self.qs_widgets:
+                self.qs_widgets[k].queue_draw()
 
     def qs_volume_row(self):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -2338,6 +3823,15 @@ class Dock(Gtk.Window):
         row.pack_start(lbl, False, False, 0)
         self.qs_widgets['mic'] = mic
 
+        rgb = self._qsbtn('󰌵', self._toggle_rgb)
+        rgb.get_accessible().set_name('Toggle RGB lights')
+        row.pack_start(rgb, False, False, 0)
+        rgb_label = Gtk.Label(label='RGB')
+        rgb_label.get_style_context().add_class('qsdim')
+        row.pack_start(rgb_label, False, False, 0)
+        self.qs_widgets['rgb'] = rgb
+        self._rgb_update()
+
         if shutil.which('hyprsunset'):
             night = self._qsbtn('󰖔', lambda _b: self._cycle_night())
             night.set_tooltip_text('Click: next intensity · '
@@ -2351,6 +3845,60 @@ class Dock(Gtk.Window):
             self.qs_widgets['night'] = night
             self.qs_widgets['nightlbl'] = nlbl
         return row
+
+    def _rgb_update(self):
+        button = self.qs_widgets.get('rgb')
+        if button is None:
+            return
+        state_path = os.path.join(
+            os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'),
+            'rgb-lights.state')
+        try:
+            with open(state_path) as f:
+                state = f.read().strip()
+        except OSError:
+            state = 'unknown'
+        button.set_sensitive(not self.rgb_busy)
+        button.set_label('…' if self.rgb_busy else
+                         '󰌵' if state == 'on' else '󰹐')
+        ctx = button.get_style_context()
+        ctx.add_class('on') if state == 'on' else ctx.remove_class('on')
+        button.set_tooltip_text('Changing lights…' if self.rgb_busy else
+            self.rgb_error or
+            (('RGB lights: off · click to turn on' if state == 'off' else
+              'RGB lights: on · click to turn off' if state == 'on' else
+              'Click to turn RGB lights off') +
+             '\nPC, keyboard and mouse · restored at login'))
+
+    def _toggle_rgb(self, _button):
+        if self.rgb_busy:
+            return
+        self.rgb_busy = True
+        self.rgb_error = ''
+        self._rgb_update()
+
+        def run():
+            error = ''
+            try:
+                result = subprocess.run(
+                    [os.path.expanduser('~/.local/bin/rgb'), 'toggle'],
+                    capture_output=True, text=True, timeout=75)
+                if result.returncode:
+                    error = result.stderr.strip() or 'RGB control failed'
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(self._rgb_finished, error)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _rgb_finished(self, error):
+        self.rgb_busy = False
+        self.rgb_error = error
+        self._rgb_update()
+        if error:
+            subprocess.Popen(['notify-send', '-u', 'normal',
+                              'RGB lights', error[:240]])
+        return False
 
     # ---------- night light: Off → warm steps → red shaders ----------
     def _night_load(self):
@@ -2485,6 +4033,7 @@ class Dock(Gtk.Window):
             self.qs_timer = None
             return False
         qw = self.qs_widgets
+        self._rgb_update()
         vol, muted = self._wpctl_vol('@DEFAULT_AUDIO_SINK@')
         if vol is not None:
             self.qs_setting = True
@@ -2502,57 +4051,1383 @@ class Dock(Gtk.Window):
             ctx.add_class('on') if val else ctx.remove_class('on')
             qw['nightlbl'].set_label('Night light')
 
-        if 'title' in qw and qw.get('player'):
-            try:
-                out = subprocess.run(
-                    ['playerctl', '-p', qw['player'], 'metadata', '--format',
-                     '{{title}}\x1f{{artist}}\x1f{{mpris:artUrl}}\x1f{{status}}'],
-                    capture_output=True, text=True, timeout=2).stdout.strip()
-                title, artist, art_url, status = (out.split('\x1f') + [''] * 4)[:4]
-                if title:
-                    qw['title'].set_label(title)
-                qw['artist'].set_label(artist)
-                qw['play'].set_label('󰏤' if status == 'Playing' else '󰐊')
-                self.qs_set_art(art_url)
-            except Exception:
-                pass
+        if 'md_card' in qw:
+            self._md_update()
         return True
 
-    def qs_set_art(self, url):
-        if not url or self.qs_widgets.get('art_url') == url:
-            return
-        self.qs_widgets['art_url'] = url
-        if url.startswith('file://'):
-            try:
-                self._apply_art(GLib.filename_from_uri(url)[0])
-            except Exception:
-                pass
-        elif url.startswith('http'):
-            os.makedirs(ART_DIR, exist_ok=True)
-            dest = os.path.join(
-                ART_DIR, hashlib.sha1(url.encode()).hexdigest())
-            if os.path.exists(dest):
-                self._apply_art(dest)
-            else:
-                def dl():
-                    try:
-                        urllib.request.urlretrieve(url, dest)
-                        GLib.idle_add(self._apply_art, dest)
-                    except Exception:
-                        pass
-                threading.Thread(target=dl, daemon=True).start()
+    # ---------- task view (WIN+TAB): all workspaces + windows ----------
+    # ---------- internet flyout (waybar network module) ----------
+    # Status from nmcli + /sys, throughput from /proc/net/dev sampled
+    # once a second into a sparkline, latency from a background ping.
+    def net_close(self):
+        if self.net_timer:
+            GLib.source_remove(self.net_timer)
+            self.net_timer = None
+        if self.net_win:
+            self.net_win.destroy()
+            self.net_win = None
+        self.net = {}
 
-    def _apply_art(self, path):
-        if self.qs_win and 'art' in self.qs_widgets:
+    def net_toggle(self):
+        if self.net_win:
+            self.net_close()
+            return
+        self.close_bar_popups()
+        w = self._backdrop('winbar-net', self.net_close, spare_bar=True)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class('wxcard')
+        card.set_halign(Gtk.Align.END)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_end(150)
+        card.set_margin_bottom(8)
+        card.set_size_request(NET_W, -1)
+        w.add(self._swallow_clicks(card))
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.net_win = w
+        self.net = {'card': card, 'ping': None,
+                    'public': None, 'pw_for': None, 'busy': None,
+                    'msg': None, 'tick': 0}
+        self.net_build()
+        w.show_all()
+        self.net_tick()
+        self.net_timer = GLib.timeout_add(1000, self.net_tick)
+        self._net_ping()
+        self._net_public_ip()
+        threading.Thread(target=lambda: subprocess.run(
+            ['nmcli', 'dev', 'wifi', 'rescan'], capture_output=True,
+            timeout=15), daemon=True).start()
+        GLib.timeout_add(3500, lambda: (self.net_win and self.net_build(),
+                                        False)[1])
+
+    @staticmethod
+    def _nm(*args):
+        try:
+            return subprocess.run(['nmcli', '-t', *args], capture_output=True,
+                                  text=True, timeout=4).stdout
+        except Exception:
+            return ''
+
+    @staticmethod
+    def _nm_split(line):
+        return [f.replace('\\:', ':') for f in re.split(r'(?<!\\):', line)]
+
+    def _net_status(self):
+        """Primary route device + what NetworkManager knows about it."""
+        dev, src, gw = None, None, None
+        try:
+            out = subprocess.run(['ip', 'route', 'get', '1.1.1.1'],
+                                 capture_output=True, text=True,
+                                 timeout=2).stdout
+            m = re.search(r'\bdev (\S+)', out)
+            dev = m and m.group(1)
+            m = re.search(r'\bsrc (\S+)', out)
+            src = m and m.group(1)
+            m = re.search(r'\bvia (\S+)', out)
+            gw = m and m.group(1)
+        except Exception:
+            pass
+        kind, conn = None, None
+        for line in self._nm('-f', 'DEVICE,TYPE,STATE,CONNECTION',
+                             'dev').splitlines():
+            f = self._nm_split(line)
+            if len(f) >= 4 and f[0] == dev:
+                kind, conn = f[1], f[3]
+        speed = None
+        try:
+            with open(f'/sys/class/net/{dev}/speed') as fh:
+                v = int(fh.read().strip())
+                if v > 0:
+                    speed = f'{v / 1000:g} Gbps' if v >= 1000 else f'{v} Mbps'
+        except Exception:
+            pass
+        ts = None
+        try:
+            out = subprocess.run(['ip', '-4', '-br', 'addr', 'show',
+                                  'tailscale0'], capture_output=True,
+                                 text=True, timeout=2).stdout.split()
+            ts = out[2].split('/')[0] if len(out) > 2 else None
+        except Exception:
+            pass
+        return dict(dev=dev, ip=src, gw=gw, kind=kind, conn=conn,
+                    speed=speed, ts=ts)
+
+    def _net_wifi(self):
+        radio = self._nm('radio', 'wifi').strip() == 'enabled'
+        nets = {}
+        if radio:
+            for line in self._nm('-f', 'IN-USE,SSID,SIGNAL,SECURITY', 'dev',
+                                 'wifi', 'list', '--rescan', 'no'
+                                 ).splitlines():
+                f = self._nm_split(line)
+                if len(f) < 4 or not f[1]:
+                    continue
+                use, ssid, sig, sec = f[0] == '*', f[1], int(f[2] or 0), f[3]
+                old = nets.get(ssid)
+                if not old or use or (sig > old['sig'] and not old['use']):
+                    nets[ssid] = dict(ssid=ssid, sig=sig, sec=sec, use=use)
+        known = {self._nm_split(l)[0] for l in
+                 self._nm('-f', 'NAME,TYPE', 'con', 'show').splitlines()
+                 if l.endswith('wireless')}
+        lst = sorted(nets.values(), key=lambda n: (not n['use'], -n['sig']))
+        return radio, lst[:NET_MAX_WIFI], known
+
+    @staticmethod
+    def _net_rate(bps):
+        for unit in ('B/s', 'KB/s', 'MB/s', 'GB/s'):
+            if bps < 1000 or unit == 'GB/s':
+                return (f'{bps:.0f} {unit}' if bps < 10 or unit == 'B/s'
+                        else f'{bps:.1f} {unit}' if bps < 100
+                        else f'{bps:.0f} {unit}')
+            bps /= 1000
+
+    @staticmethod
+    def _wifi_glyph(sig):
+        return ('\U000F091F', '\U000F0922', '\U000F0925',
+                '\U000F0928')[min(3, sig // 25)]
+
+    def net_build(self):
+        n = self.net
+        n['sel'] = []
+        card = n['card']
+        for c in card.get_children():
+            card.remove(c)
+        st = self._net_status()
+        n['st'] = st
+        radio, nets, known = self._net_wifi()
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ('top', 'start', 'end'):
+            getattr(body, f'set_margin_{m}')(20)
+        body.set_margin_bottom(16)
+
+        # hero
+        hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        online = bool(st['dev'])
+        if not online:
+            glyph, title, sub = '\U000F05AA', 'Not connected', 'No internet route'
+        elif st['kind'] == 'wifi':
+            cur = next((x for x in nets if x['use']), None)
+            glyph = self._wifi_glyph(cur['sig'] if cur else 100)
+            title = st['conn'] or 'Wi-Fi'
+            sub = f"Wi-Fi  ·  {cur['sig']}% signal" if cur else 'Wi-Fi'
+        else:
+            glyph = '\U000F0200'
+            title = 'Ethernet'
+            sub = st['conn'] or st['dev']
+            if st['speed']:
+                sub += f"  ·  {st['speed']}"
+        # drawn, not a Label: centred on the glyph's ink box, since nerd
+        # font glyphs carry uneven side bearings
+        g = Gtk.DrawingArea()
+        g.set_size_request(56, 56)
+        g.connect('draw', self._net_draw_glyph, glyph, online)
+        hero.pack_start(g, False, False, 0)
+        tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        tb.set_valign(Gtk.Align.CENTER)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.pack_start(self._lbl(title, 'nettitle'), False, False, 0)
+        pill = self._lbl('Connected' if online else 'Offline', 'netpill')
+        pill.get_style_context().add_class('on' if online else 'off')
+        pill.set_valign(Gtk.Align.CENTER)
+        row.pack_start(pill, False, False, 0)
+        tb.pack_start(row, False, False, 0)
+        tb.pack_start(self._lbl(sub, 'wxsub'), False, False, 0)
+        hero.pack_start(tb, True, True, 0)
+        body.pack_start(hero, False, False, 0)
+
+        # live throughput
+        if online:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.get_style_context().add_class('netgraphbox')
+            rates = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+            down = self._lbl('\U000F01DA  —', 'netrate')
+            down.get_style_context().add_class('down')
+            up = self._lbl('\U000F0552  —', 'netrate')
+            up.get_style_context().add_class('up')
+            rates.pack_start(down, False, False, 0)
+            rates.pack_start(up, False, False, 0)
+            ping = self._lbl('', 'wxdim', 1.0)
+            rates.pack_end(ping, False, False, 0)
+            box.pack_start(rates, False, False, 0)
+            graph = Gtk.DrawingArea()
+            graph.set_size_request(-1, 58)
+            graph.connect('draw', self._net_draw_graph)
+            box.pack_start(graph, False, False, 0)
+            foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            cap = self._lbl('', 'netcap')
+            cap.set_ellipsize(Pango.EllipsizeMode.END)
+            foot.pack_start(cap, True, True, 0)
+            tabs = {}
+            for key, label in (('session', 'Session'), ('live', 'Live')):
+                t = Gtk.Button(label=label)
+                t.get_style_context().add_class('nettab')
+                t.set_can_focus(False)
+                t.connect('clicked', lambda *_, k=key: self._net_set_view(k))
+                foot.pack_end(t, False, False, 0)
+                tabs[key] = t
+            box.pack_start(foot, False, False, 0)
+            body.pack_start(box, False, False, 0)
+            n.update(w_down=down, w_up=up, w_ping=ping, w_graph=graph,
+                     w_cap=cap, w_tabs=tabs)
+            self._net_set_view(self.net_view)
+
+            # details
+            chips = Gtk.Grid()
+            chips.set_column_spacing(8)
+            chips.set_row_spacing(8)
+            chips.set_column_homogeneous(True)
+            items = [('\U000F0A5F', 'Local IP', st['ip'] or '—'),
+                     ('\U000F01A7', 'Public IP', n['public'] or '…'),
+                     ('\U000F0484', 'Gateway', st['gw'] or '—')]
+            items.append(('\U000F0582', 'Tailscale', st['ts'])
+                         if st['ts'] else
+                         ('\U000F0FDA', 'Interface', st['dev']))
+            for i, (gl, name, val) in enumerate(items):
+                chip = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                chip.get_style_context().add_class('wxchip')
+                top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                              spacing=5)
+                top.pack_start(self._lbl(gl, 'wxchipglyph'), False, False, 0)
+                top.pack_start(self._lbl(name, 'wxdim'), False, False, 0)
+                chip.pack_start(top, False, False, 0)
+                vl = self._lbl(val, 'netval')
+                vl.set_ellipsize(Pango.EllipsizeMode.END)
+                vl.set_halign(Gtk.Align.START)   # spoiler pill hugs the text
+                vl.set_can_focus(False)   # selectable, but don't open highlighted
+                chip.pack_start(vl, False, False, 0)
+                if name == 'Public IP':
+                    n['w_public'] = vl
+                if name in NET_SPOILERS:
+                    # Discord-style spoiler: text painted out until
+                    # clicked; n is rebuilt on every open, so it re-hides
+                    eye = self._lbl('', 'netspoileye')
+                    top.pack_end(eye, False, False, 0)
+                    eb = Gtk.EventBox()
+                    eb.add(chip)
+                    eb.connect('button-press-event', lambda *_, k=name: (
+                        self._net_spoil(k), True)[1])
+                    n.setdefault('spoil_w', {})[name] = (chip, vl, eye)
+                    self._net_spoil_paint(name)
+                    chips.attach(eb, i % 2, i // 2, 1, 1)
+                    continue
+                vl.set_selectable(True)
+                n.setdefault('sel', []).append(vl)
+                chips.attach(chip, i % 2, i // 2, 1, 1)
+            body.pack_start(chips, False, False, 0)
+
+        # wi-fi
+        wf = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hdr.pack_start(self._lbl('Wi-Fi', 'wxhdr'), False, False, 0)
+        if n['busy']:
+            sp = Gtk.Spinner()
+            sp.start()
+            hdr.pack_start(sp, False, False, 0)
+        # hand-drawn pill: Gtk.Switch's on/off icons are missing from
+        # the icon theme and render as broken-image glyphs
+        sw = Gtk.Button()
+        sw.set_relief(Gtk.ReliefStyle.NONE)
+        sw.set_can_focus(False)
+        sw.set_valign(Gtk.Align.CENTER)
+        sw.get_style_context().add_class('wxtoggle')
+        if radio:
+            sw.get_style_context().add_class('on')
+        knob = Gtk.Box()
+        knob.get_style_context().add_class('wxknob')
+        knob.set_halign(Gtk.Align.END if radio else Gtk.Align.START)
+        knob.set_valign(Gtk.Align.CENTER)
+        sw.add(knob)
+        sw.set_tooltip_text('Turn Wi-Fi ' + ('off' if radio else 'on'))
+        sw.connect('clicked', lambda *_: self._net_radio(not radio))
+        hdr.pack_end(sw, False, False, 0)
+        if radio:
+            rb = Gtk.Button(label='\U000F0450')
+            rb.get_style_context().add_class('wxicon')
+            rb.set_tooltip_text('Scan')
+            rb.connect('clicked', self._net_rescan)
+            hdr.pack_end(rb, False, False, 0)
+        wf.pack_start(hdr, False, False, 0)
+        if n['msg']:
+            wf.pack_start(self._lbl(n['msg'], 'wxerr'), False, False, 0)
+        if radio:
+            lb = Gtk.ListBox()
+            lb.get_style_context().add_class('netlist')
+            lb.set_selection_mode(Gtk.SelectionMode.NONE)
+            for net in nets:
+                lb.add(self._net_row(net, known))
+            if not nets:
+                lb.add(self._lbl('No networks found', 'wxdim'))
+            sc = Gtk.ScrolledWindow()
+            sc.get_style_context().add_class('stscroll')
+            sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sc.set_propagate_natural_height(True)
+            sc.set_max_content_height(NET_LIST_H)
+            sc.add(lb)
+            wf.pack_start(sc, False, False, 0)
+        else:
+            wf.pack_start(self._lbl('Wi-Fi is off', 'wxdim'), False, False, 0)
+        body.pack_start(wf, False, False, 0)
+        card.pack_start(body, False, False, 0)
+
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        foot.get_style_context().add_class('wxfooter')
+        src = self._lbl(st['dev'] or 'offline', 'wxdim')
+        src.set_margin_start(20)
+        foot.pack_start(src, False, False, 0)
+        fb = Gtk.Button(label='Network settings  \U000F03CC')
+        fb.get_style_context().add_class('wxlink')
+        fb.set_margin_end(12)
+        fb.connect('clicked', self._net_settings)
+        foot.pack_end(fb, False, False, 0)
+        card.pack_start(foot, False, False, 0)
+        card.show_all()
+        # GTK selects a selectable label's text when the window takes focus
+        GLib.idle_add(lambda: [l.select_region(0, 0)
+                               for l in n.get('sel', [])] and False)
+        self._net_paint()
+
+    def _net_row(self, net, known):
+        n = self.net
+        row = Gtk.ListBoxRow()
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        g = self._lbl(self._wifi_glyph(net['sig']), 'netwglyph')
+        if net['use']:
+            g.get_style_context().add_class('online')
+        h.pack_start(g, False, False, 0)
+        tv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        tv.set_valign(Gtk.Align.CENTER)
+        nm = self._lbl(net['ssid'], 'netval')
+        nm.set_ellipsize(Pango.EllipsizeMode.END)
+        tv.pack_start(nm, False, False, 0)
+        secured = net['sec'] not in ('', '--')
+        sub = ('Connected' if net['use'] else
+               'Saved' if net['ssid'] in known else
+               'Secured' if secured else 'Open')
+        if n['busy'] == net['ssid']:
+            sub = 'Connecting…'
+        tv.pack_start(self._lbl(sub, 'wxdim'), False, False, 0)
+        h.pack_start(tv, True, True, 0)
+        if secured:
+            h.pack_end(self._lbl('\U000F033E', 'netlock'), False, False, 0)
+        if net['use']:
+            b = Gtk.Button(label='Disconnect')
+            b.get_style_context().add_class('wxlink')
+            b.connect('clicked', lambda *_: self._net_run(
+                ['nmcli', 'dev', 'disconnect', n['st']['dev'] or 'wlan0'],
+                net['ssid']))
+            h.pack_end(b, False, False, 0)
+        v.pack_start(h, False, False, 0)
+
+        if n['pw_for'] == net['ssid']:
+            pr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            pr.get_style_context().add_class('wxsearch')
+            e = Gtk.Entry()
+            e.get_style_context().add_class('wxentry')
+            e.set_visibility(False)
+            e.set_placeholder_text('Password')
+            e.set_hexpand(True)
+            go = Gtk.Button(label='\U000F012C')
+            go.get_style_context().add_class('wxicon')
+
+            def submit(*_):
+                self.net['pw_for'] = None
+                self._net_run(['nmcli', 'dev', 'wifi', 'connect',
+                               net['ssid'], 'password', e.get_text()],
+                              net['ssid'])
+            e.connect('activate', submit)
+            go.connect('clicked', submit)
+            pr.pack_start(e, True, True, 0)
+            pr.pack_start(go, False, False, 0)
+            v.pack_start(pr, False, False, 0)
+            GLib.idle_add(lambda: (e.grab_focus(), False)[1])
+
+        eb = Gtk.EventBox()
+        eb.add(v)
+        eb.connect('button-press-event',
+                   lambda *_: (self._net_pick(net, known), True)[1]
+                   if not net['use'] and n['pw_for'] != net['ssid']
+                   else False)
+        row.add(eb)
+        return row
+
+    def _net_spoil(self, name):
+        shown = self.net.setdefault('shown', set())
+        shown.symmetric_difference_update({name})
+        self._net_spoil_paint(name)
+
+    def _net_spoil_paint(self, name):
+        chip, vl, eye = self.net['spoil_w'][name]
+        shown = name in self.net.get('shown', ())
+        ctx = vl.get_style_context()
+        if shown:
+            ctx.remove_class('spoiler')
+        else:
+            ctx.add_class('spoiler')
+        vl.set_selectable(shown)
+        if shown:
+            GLib.idle_add(lambda: (vl.select_region(0, 0), False)[1])
+        eye.set_label('\U000F0209' if shown else '\U000F0208')
+        chip.set_tooltip_text('Click to hide' if shown else 'Click to reveal')
+
+    def _net_pick(self, net, known):
+        if self.net['busy']:
+            return
+        if net['ssid'] in known:
+            self._net_run(['nmcli', 'con', 'up', 'id', net['ssid']],
+                          net['ssid'])
+        elif net['sec'] in ('', '--'):
+            self._net_run(['nmcli', 'dev', 'wifi', 'connect', net['ssid']],
+                          net['ssid'])
+        else:
+            self.net['pw_for'] = net['ssid']
+            if hasattr(GtkLayerShell, 'set_keyboard_mode'):
+                GtkLayerShell.set_keyboard_mode(
+                    self.net_win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+            self.net_build()
+
+    def _net_run(self, cmd, ssid):
+        self.net.update(busy=ssid, msg=None)
+        self.net_build()
+
+        def run():
             try:
-                pix = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    path, 56, 56, True)
-                self.qs_widgets['art'].set_from_pixbuf(pix)
-            except Exception:
-                pass
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=45)
+                err = None if r.returncode == 0 else (
+                    (r.stderr or r.stdout).strip().splitlines() or ['Failed']
+                )[-1]
+            except Exception as e:
+                err = str(e)
+            GLib.idle_add(self._net_ran, err)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _net_ran(self, err):
+        if self.net_win:
+            if err:
+                err = re.sub(r'^Error:\s*', '', err)
+                if 'Secrets were required' in err or 'password' in err.lower():
+                    err = 'Wrong password'
+            self.net.update(busy=None, msg=err)
+            self.net_build()
         return False
 
-    # ---------- task view (WIN+TAB): all workspaces + windows ----------
+    def _net_radio(self, on):
+        subprocess.Popen(['nmcli', 'radio', 'wifi', 'on' if on else 'off'])
+        GLib.timeout_add(1500, lambda: (self.net_win and self.net_build(),
+                                        False)[1])
+
+    def _net_rescan(self, *_):
+        self.net['busy'] = '…'
+        self.net_build()
+
+        def run():
+            subprocess.run(['nmcli', 'dev', 'wifi', 'rescan'],
+                           capture_output=True, timeout=15)
+            time.sleep(2.5)
+            GLib.idle_add(self._net_ran, None)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _net_settings(self, *_):
+        self.net_close()
+        if shutil.which('nm-connection-editor'):
+            cmd = ['nm-connection-editor']
+        else:
+            term = shutil.which('kitty') or shutil.which('alacritty')
+            cmd = [term, '-e', 'nmtui'] if term else ['nmtui']
+        subprocess.Popen(cmd, start_new_session=True)
+
+    def _net_ping(self):
+        def run():
+            ms = None
+            try:
+                out = subprocess.run(['ping', '-c1', '-W1', '1.1.1.1'],
+                                     capture_output=True, text=True,
+                                     timeout=3).stdout
+                m = re.search(r'time=([\d.]+)', out)
+                ms = float(m.group(1)) if m else None
+            except Exception:
+                pass
+            GLib.idle_add(self._net_set, 'ping', ms)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _net_public_ip(self):
+        if self.net_public:
+            self.net['public'] = self.net_public
+            return
+
+        def run():
+            ip = None
+            try:
+                with urllib.request.urlopen('https://api.ipify.org',
+                                            timeout=6) as r:
+                    ip = r.read().decode().strip()
+            except Exception:
+                pass
+            GLib.idle_add(self._net_set, 'public', ip or 'unavailable')
+        threading.Thread(target=run, daemon=True).start()
+
+    def _net_set(self, key, val):
+        if self.net_win:
+            self.net[key] = val
+            if key == 'public' and val != 'unavailable':
+                self.net_public = val
+            self._net_paint()
+        return False
+
+    @staticmethod
+    def _net_counters():
+        """rx/tx bytes summed over physical NICs (skips lo, docker, veth,
+        bridges and tunnels, whose traffic also crosses a real NIC)."""
+        rx = tx = 0
+        with open('/proc/net/dev') as f:
+            for line in f.readlines()[2:]:
+                name, _, rest = line.partition(':')
+                name = name.strip()
+                if not os.path.exists(f'/sys/class/net/{name}/device'):
+                    continue
+                v = rest.split()
+                rx += int(v[0])
+                tx += int(v[8])
+        return rx, tx
+
+    def _nstat_sample(self):
+        ns = self.nstat
+        try:
+            rx, tx = self._net_counters()
+        except Exception:
+            return True
+        now = time.monotonic()
+        if ns['last']:
+            lrx, ltx, lt = ns['last']
+            dt = max(0.001, now - lt)
+            # counters reset when a NIC goes down/up: count that tick as 0
+            drx, dtx = max(0, rx - lrx), max(0, tx - ltx)
+            ns['rx'] += drx
+            ns['tx'] += dtx
+            ns['live'].append((drx / dt, dtx / dt))
+            del ns['live'][:-NET_HIST]
+            cur = ns['cur']
+            cur[0] += drx
+            cur[1] += dtx
+            cur[2] += dt
+            if cur[2] >= ns['span']:
+                ns['buckets'].append(tuple(cur))
+                ns['cur'] = [0, 0, 0.0]
+                bk = ns['buckets']
+                if len(bk) >= 2 * NET_SESS_N:
+                    ns['buckets'] = [
+                        tuple(x + y for x, y in zip(bk[i], bk[i + 1]))
+                        for i in range(0, len(bk) - 1, 2)]
+                    ns['span'] *= 2
+        ns['last'] = (rx, tx, now)
+        if self.net_win:
+            self._net_paint()
+        return True
+
+    def _net_series(self):
+        ns = self.nstat
+        if self.net_view == 'live':
+            return ns['live']
+        pts = [(r / t, x / t) for r, x, t in ns['buckets'] if t > 0]
+        r, x, t = ns['cur']
+        if t >= 1:
+            pts.append((r / t, x / t))
+        return pts
+
+    def _net_set_view(self, view):
+        self.net_view = view
+        for k, btn in self.net.get('w_tabs', {}).items():
+            ctx = btn.get_style_context()
+            ctx.add_class('on') if k == view else ctx.remove_class('on')
+        self._net_paint()
+
+    @staticmethod
+    def _net_bytes(n):
+        for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+            if n < 1000 or unit == 'TB':
+                return f'{n:.0f} {unit}' if unit == 'B' or n >= 100 \
+                    else f'{n:.1f} {unit}'
+            n /= 1000
+
+    def net_tick(self):
+        """Panel-only work: ping every 3 s (sampling runs all session)."""
+        if not self.net_win:
+            self.net_timer = None
+            return False
+        n = self.net
+        n['tick'] += 1
+        if n['tick'] % 3 == 0:
+            self._net_ping()
+        return True
+
+    def _net_paint(self):
+        n = self.net
+        if 'w_down' not in n:
+            return
+        ns = self.nstat
+        if ns['live']:
+            d, u = ns['live'][-1]
+            n['w_down'].set_label('\U000F01DA  ' + self._net_rate(d))
+            n['w_up'].set_label('\U000F0552  ' + self._net_rate(u))
+        if self.net_view == 'live':
+            cap = 'Last 60 seconds'
+        else:
+            since = time.strftime('%-I:%M %p', time.localtime(ns['start']))
+            cap = (f"Since {since}   \U000F01DA {self._net_bytes(ns['rx'])}"
+                   f"   \U000F0552 {self._net_bytes(ns['tx'])}")
+        n['w_cap'].set_label(cap)
+        p = n.get('ping')
+        n['w_ping'].set_label(f'{p:.0f} ms ping' if p is not None else '')
+        if n.get('w_public') and n.get('public'):
+            n['w_public'].set_label(n['public'])
+        n['w_graph'].queue_draw()
+
+    def _net_draw_glyph(self, w, cr, glyph, online):
+        S = 56
+        r, g, b = self._md_default_rgb() if online else (1, 1, 1)
+        self._md_rrect(cr, 0, 0, S, S, 14)
+        cr.set_source_rgba(r, g, b, 0.16 if online else 0.07)
+        cr.fill()
+        gi.require_version('PangoCairo', '1.0')
+        from gi.repository import PangoCairo
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(
+            Pango.FontDescription('Commit Mono Nerd Font 22'))
+        layout.set_text(glyph, -1)
+        ink, _ = layout.get_pixel_extents()
+        cr.move_to(round((S - ink.width) / 2 - ink.x),
+                   round((S - ink.height) / 2 - ink.y))
+        cr.set_source_rgba(r, g, b, 1 if online else 0.55)
+        PangoCairo.show_layout(cr, layout)
+        return False
+
+    def _net_draw_graph(self, w, cr):
+        import cairo
+        W, H = w.get_allocated_width(), w.get_allocated_height()
+        hist = self._net_series()
+        r, g, b = self._md_default_rgb()
+        peak = max([64e3] + [max(x) for x in hist])
+        slots = NET_HIST if self.net_view == 'live' else len(hist)
+        step = W / max(1, slots - 1)
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.set_line_width(1)
+        for i in (1, 2, 3):
+            y = round(H * i / 4) + 0.5
+            cr.move_to(0, y)
+            cr.line_to(W, y)
+        cr.stroke()
+        if len(hist) < 2:
+            return False
+        x0 = W - (len(hist) - 1) * step
+
+        def path(idx):
+            cr.move_to(x0, H - hist[0][idx] / peak * (H - 4))
+            for i, s in enumerate(hist[1:], 1):
+                cr.line_to(x0 + i * step, H - s[idx] / peak * (H - 4))
+
+        path(0)
+        cr.line_to(W, H)
+        cr.line_to(x0, H)
+        cr.close_path()
+        grad = cairo.LinearGradient(0, 0, 0, H)
+        grad.add_color_stop_rgba(0, r, g, b, 0.45)
+        grad.add_color_stop_rgba(1, r, g, b, 0.02)
+        cr.set_source(grad)
+        cr.fill()
+        path(0)
+        cr.set_source_rgb(r, g, b)
+        cr.set_line_width(1.6)
+        cr.stroke()
+        path(1)
+        cr.set_source_rgba(1, 1, 1, 0.55)
+        cr.set_line_width(1.2)
+        cr.set_dash([3, 3])
+        cr.stroke()
+        return False
+
+    # ---------- clock / calendar flyout (waybar clock) ----------
+    def clk_close(self):
+        if self.clk_timer:
+            GLib.source_remove(self.clk_timer)
+            self.clk_timer = None
+        if self.clk_win:
+            self.clk_win.destroy()
+            self.clk_win = None
+        self.clk = {}
+
+    def clk_toggle(self):
+        if self.clk_win:
+            self.clk_close()
+            return
+        self.close_bar_popups()
+        w = self._backdrop('winbar-clock', self.clk_close, spare_bar=True)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class('wxcard')
+        card.set_halign(Gtk.Align.END)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_end(10)
+        card.set_margin_bottom(8)
+        card.set_size_request(CLK_W, -1)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        for m in ('top', 'start', 'end'):
+            getattr(body, f'set_margin_{m}')(22)
+        body.set_margin_bottom(18)
+
+        # big time
+        tr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        hm = self._lbl('', 'clkbig')
+        sec = self._lbl('', 'clksec')
+        sec.set_valign(Gtk.Align.END)
+        sec.set_margin_bottom(11)
+        ampm = self._lbl('', 'clkampm')
+        ampm.set_valign(Gtk.Align.END)
+        ampm.set_margin_bottom(12)
+        ampm.set_margin_start(8)
+        tr.pack_start(hm, False, False, 0)
+        tr.pack_start(sec, False, False, 0)
+        tr.pack_start(ampm, False, False, 0)
+        body.pack_start(tr, False, False, 0)
+        date = self._lbl('', 'clkdate')
+        tv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        body.remove(tr)
+        tv.pack_start(tr, False, False, 0)
+        tv.pack_start(date, False, False, 0)
+        body.pack_start(tv, False, False, 0)
+
+        # calendar
+        cal = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        cal.get_style_context().add_class('clkcal')
+        nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        month = Gtk.Button(label='')
+        month.get_style_context().add_class('wxlink')
+        month.get_style_context().add_class('clkmonth')
+        month.set_tooltip_text('Back to today')
+        month.connect('clicked', lambda *_: self._clk_month(None))
+        nav.pack_start(month, False, False, 0)
+        for glyph, step in (('\U000F0140', 1), ('\U000F0143', -1)):
+            b = Gtk.Button(label=glyph)
+            b.get_style_context().add_class('wxicon')
+            b.connect('clicked', lambda *_, s=step: self._clk_month(s))
+            nav.pack_end(b, False, False, 0)
+        cal.pack_start(nav, False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_column_homogeneous(True)
+        grid.set_row_spacing(2)
+        grid.set_column_spacing(2)
+        cal.pack_start(grid, False, False, 0)
+        ev = Gtk.EventBox()
+        ev.add_events(Gdk.EventMask.SCROLL_MASK
+                      | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        ev.connect('scroll-event', self._clk_scroll)
+        ev.add(cal)
+        body.pack_start(ev, False, False, 0)
+        card.pack_start(body, False, False, 0)
+
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        foot.get_style_context().add_class('wxfooter')
+        info = self._lbl('', 'wxdim')
+        info.set_margin_start(22)
+        foot.pack_start(info, False, False, 0)
+        tz = self._lbl('', 'wxdim', 1.0)
+        tz.set_margin_end(22)
+        foot.pack_end(tz, False, False, 0)
+        card.pack_start(foot, False, False, 0)
+
+        w.add(self._swallow_clicks(card))
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        now = time.localtime()
+        self.clk = dict(hm=hm, sec=sec, ampm=ampm, date=date, month=month,
+                        grid=grid, info=info, tz=tz,
+                        ym=(now.tm_year, now.tm_mon))
+        self.clk_win = w
+        self._clk_fill()
+        self.clk_tick()
+        w.show_all()
+        # tick on the second boundary so seconds never skip
+        GLib.timeout_add(1000 - int(time.time() * 1000) % 1000 + 5,
+                         self._clk_start)
+
+    def _clk_start(self):
+        if self.clk_win:
+            self.clk_tick()
+            self.clk_timer = GLib.timeout_add(1000, self.clk_tick)
+        return False
+
+    def clk_tick(self):
+        if not self.clk_win:
+            self.clk_timer = None
+            return False
+        c = self.clk
+        now = time.localtime()
+        c['hm'].set_label(time.strftime('%-I:%M', now))
+        c['sec'].set_label(time.strftime(':%S', now))
+        c['ampm'].set_label(time.strftime('%p', now))
+        c['date'].set_label(time.strftime('%A, %B %-d, %Y', now))
+        days = 366 if (now.tm_year % 4 == 0 and (now.tm_year % 100 != 0
+                                                  or now.tm_year % 400 == 0)
+                       ) else 365
+        c['info'].set_label(f"Week {time.strftime('%V', now).lstrip('0')}"
+                            f"  ·  Day {now.tm_yday} of {days}")
+        off = time.strftime('%z', now)
+        c['tz'].set_label(f"{time.strftime('%Z', now)}  "
+                          f"UTC{off[0]}{int(off[1:3])}"
+                          + (f':{off[3:]}' if off[3:] != '00' else ''))
+        if c.get('today') != now.tm_yday:     # midnight rollover
+            if c.get('today') is not None:
+                self._clk_fill()
+            c['today'] = now.tm_yday
+        return True
+
+    def _clk_month(self, step):
+        y, m = self.clk['ym']
+        if step is None:
+            now = time.localtime()
+            y, m = now.tm_year, now.tm_mon
+        else:
+            m += step
+            y, m = (y + (m - 1) // 12, (m - 1) % 12 + 1)
+        self.clk['ym'] = (y, m)
+        self._clk_fill()
+
+    def _clk_scroll(self, _w, ev):
+        d = ev.direction
+        if d == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = ev.get_scroll_deltas()
+            if not ok or abs(dy) < 0.5:
+                return True
+            step = 1 if dy > 0 else -1
+        else:
+            step = {Gdk.ScrollDirection.DOWN: 1,
+                    Gdk.ScrollDirection.UP: -1}.get(d)
+        if step:
+            self._clk_month(step)
+        return True
+
+    def _clk_fill(self):
+        import calendar
+        c = self.clk
+        y, m = c['ym']
+        now = time.localtime()
+        c['month'].set_label(f'{calendar.month_name[m]} {y}')
+        grid = c['grid']
+        for ch in grid.get_children():
+            grid.remove(ch)
+        for i, wd in enumerate(('Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa')):
+            grid.attach(self._lbl(wd, 'clkwd', 0.5), i, 0, 1, 1)
+        cal = calendar.Calendar(firstweekday=6)
+        weeks = cal.monthdatescalendar(y, m)
+        while len(weeks) < 6:          # fixed height: no jumping
+            last = weeks[-1][-1]
+            import datetime
+            weeks.append([last + datetime.timedelta(days=i)
+                          for i in range(1, 8)])
+        for r, week in enumerate(weeks, 1):
+            for col, d in enumerate(week):
+                lbl = self._lbl(str(d.day), 'clkday', 0.5)
+                ctx = lbl.get_style_context()
+                if d.month != m:
+                    ctx.add_class('other')
+                if (d.year, d.month, d.day) == (now.tm_year, now.tm_mon,
+                                                now.tm_mday):
+                    ctx.add_class('clktoday')
+                if col in (0, 6):
+                    ctx.add_class('weekend')
+                lbl.set_size_request(36, 34)
+                lbl.set_halign(Gtk.Align.CENTER)
+                grid.attach(lbl, col, r, 1, 1)
+        grid.show_all()
+
+    # ---------- weather flyout (opened from the waybar weather module) ----
+    # Data is wttr.in j1 JSON, shared with ~/.config/waybar/scripts/
+    # weather.py through WX_CACHE: whoever fetches writes it, both read it.
+    def wx_close(self):
+        self.wx_editing = False
+        self.wx_error = None
+        if self.wx_win:
+            self.wx_win.destroy()
+            self.wx_win = None
+        self.wx_body = None
+
+    def wx_toggle(self):
+        if self.wx_win:
+            self.wx_close()
+            return
+        self.close_bar_popups()
+        w = self._backdrop(
+            'winbar-weather', self.wx_close, spare_bar=True,
+            on_escape=lambda: (self.wx_cancel_edit() if self.wx_editing
+                               else self.wx_close()))
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class('wxcard')
+        card.set_halign(Gtk.Align.END)
+        card.set_valign(Gtk.Align.END)
+        card.set_margin_end(96)
+        card.set_margin_bottom(8)
+        card.set_size_request(WX_W, -1)
+        self.wx_body = card
+        w.add(self._swallow_clicks(card))
+        gm = self._cursor_gdk_mon()
+        if gm:
+            GtkLayerShell.set_monitor(w, gm)
+        self.wx_win = w
+
+        data, age = self.wx_load()
+        self.wx_render(data)
+        w.show_all()
+        if data is None or age > WX_MAX_AGE:
+            self.wx_refresh()
+
+    @staticmethod
+    def wx_load():
+        try:
+            with open(WX_CACHE) as f:
+                data = json.load(f)
+            if data.get('_loc', '') != wx_location():
+                return data, 1e9
+            return data, time.time() - os.path.getmtime(WX_CACHE)
+        except Exception:
+            return None, 1e9
+
+    def wx_refresh(self, *_, loc=None):
+        """Fetch fresh data. With loc, try that place first and only
+        save it as the new location if wttr.in recognises it."""
+        if self.wx_fetching:
+            return
+        self.wx_fetching = True
+        self.wx_error = None
+        if self.wx_win and self.wx_body:
+            self.wx_render(self.wx_load()[0])
+        new_loc = loc is not None
+        loc = wx_location() if loc is None else loc.strip()
+
+        def run():
+            data = None
+            try:
+                req = urllib.request.Request(
+                    wx_url(loc), headers={'User-Agent': 'curl/8'})
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    data = json.load(r)
+                if not data.get('current_condition'):
+                    raise ValueError('unknown location')
+                data['_loc'] = loc
+                if new_loc:
+                    os.makedirs(os.path.dirname(WX_LOC_FILE), exist_ok=True)
+                    with open(WX_LOC_FILE, 'w') as f:
+                        f.write(loc + '\n')
+                os.makedirs(os.path.dirname(WX_CACHE), exist_ok=True)
+                tmp = WX_CACHE + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(data, f)
+                os.replace(tmp, WX_CACHE)
+                # nudge the bar module so it shows the same reading
+                subprocess.Popen(['pkill', '-RTMIN+8', '-x', 'waybar'])
+            except Exception as e:
+                print(f'winbar-dock: weather fetch failed: {e}',
+                      file=sys.stderr)
+                if new_loc:
+                    self.wx_error = f'Couldn\u2019t find \u201c{loc}\u201d'
+            GLib.idle_add(self._wx_fetched, data)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _wx_fetched(self, data):
+        self.wx_fetching = False
+        if data is not None:
+            self.wx_editing = False
+        if self.wx_win and self.wx_body:
+            self.wx_render(data or self.wx_load()[0])
+        return False
+
+    def wx_start_edit(self, *_):
+        self.wx_editing = True
+        self.wx_error = None
+        # the entry needs the keyboard; ON_DEMAND alone won't hand it over
+        if hasattr(GtkLayerShell, 'set_keyboard_mode'):
+            GtkLayerShell.set_keyboard_mode(
+                self.wx_win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        self.wx_render(self.wx_load()[0])
+
+    def wx_cancel_edit(self, *_):
+        self.wx_editing = False
+        self.wx_render(self.wx_load()[0])
+
+    def wx_loc_editor(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.get_style_context().add_class('wxsearch')
+        row.pack_start(self._lbl('\U000F034E', 'wxpin'), False, False, 0)
+        entry = Gtk.Entry()
+        entry.get_style_context().add_class('wxentry')
+        entry.set_placeholder_text('City, ZIP code or airport')
+        entry.set_text(wx_location())
+        entry.set_hexpand(True)
+        entry.set_sensitive(not self.wx_fetching)
+
+        def submit(*_):
+            self.wx_refresh(loc=entry.get_text())
+
+        def key(_e, ev):
+            if ev.keyval == Gdk.KEY_Escape:
+                self.wx_cancel_edit()
+                return True
+            return False
+        entry.connect('activate', submit)
+        entry.connect('key-press-event', key)
+        row.pack_start(entry, True, True, 0)
+        ok = Gtk.Button(label='\U000F012C')
+        ok.get_style_context().add_class('wxicon')
+        ok.set_tooltip_text('Set location')
+        ok.connect('clicked', submit)
+        row.pack_start(ok, False, False, 0)
+        box.pack_start(row, False, False, 0)
+        hint = self._lbl('City, ZIP code or airport \u2014 e.g. Tokyo, '
+                         '90210, LAX', 'wxdim')
+        hint.set_margin_start(14)
+        box.pack_start(hint, False, False, 0)
+
+        acts = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        auto = Gtk.Button(label='\U000F01A4  Use my location')
+        auto.get_style_context().add_class('wxlink')
+        auto.set_tooltip_text('Locate automatically from your IP address')
+        auto.connect('clicked', lambda *_: self.wx_refresh(loc=''))
+        acts.pack_start(auto, False, False, 0)
+        cancel = Gtk.Button(label='Cancel')
+        cancel.get_style_context().add_class('wxlink')
+        cancel.connect('clicked', self.wx_cancel_edit)
+        acts.pack_end(cancel, False, False, 0)
+        if self.wx_fetching:
+            sp = Gtk.Spinner()
+            sp.start()
+            acts.pack_end(sp, False, False, 4)
+        for b in (auto, cancel):
+            b.set_sensitive(not self.wx_fetching)
+        box.pack_start(acts, False, False, 0)
+        GLib.idle_add(lambda: (entry.grab_focus(),
+                               entry.set_position(-1), False)[2])
+        return box
+
+    @staticmethod
+    def wx_kind(code, night=False):
+        code = int(code)
+        kind = next((k for k, codes in WX_GROUPS.items() if code in codes),
+                    'clear')
+        if night and kind in ('clear', 'partly'):
+            kind = 'night' if kind == 'clear' else 'partly_n'
+        return kind
+
+    @staticmethod
+    def wx_is_night(astro, hhmm):
+        """hhmm: minutes since midnight."""
+        try:
+            def mins(s):
+                t = time.strptime(s.strip(), '%I:%M %p')
+                return t.tm_hour * 60 + t.tm_min
+            return not (mins(astro['sunrise']) <= hhmm < mins(astro['sunset']))
+        except Exception:
+            return False
+
+    def wx_glyph(self, kind, size_class):
+        lbl = Gtk.Label(label=WX_ICONS[kind])
+        ctx = lbl.get_style_context()
+        ctx.add_class('wxglyph')
+        ctx.add_class(size_class)
+        ctx.add_class('wx-' + kind)
+        return lbl
+
+    @staticmethod
+    def _lbl(text, cls, xalign=0.0):
+        l = Gtk.Label(label=text)
+        l.get_style_context().add_class(cls)
+        l.set_xalign(xalign)
+        return l
+
+    def wx_render(self, data):
+        card = self.wx_body
+        for c in card.get_children():
+            card.remove(c)
+
+        if not data:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            box.set_size_request(-1, 220)
+            box.set_valign(Gtk.Align.CENTER)
+            if self.wx_fetching:
+                sp = Gtk.Spinner()
+                sp.start()
+                sp.set_size_request(28, 28)
+                box.pack_start(sp, True, False, 0)
+                box.pack_start(self._lbl('Fetching weather…', 'wxdim', 0.5),
+                               False, False, 0)
+            else:
+                box.pack_start(self._lbl('Weather unavailable', 'wxsub', 0.5),
+                               True, False, 0)
+                b = Gtk.Button(label='Try again')
+                b.get_style_context().add_class('wxlink')
+                b.set_halign(Gtk.Align.CENTER)
+                b.connect('clicked', self.wx_refresh)
+                box.pack_start(b, False, False, 0)
+            card.pack_start(box, True, True, 0)
+            card.show_all()
+            return
+
+        cur = data['current_condition'][0]
+        days = data['weather']
+        now = time.localtime()
+        now_m = now.tm_hour * 60 + now.tm_min
+        kind = self.wx_kind(cur['weatherCode'],
+                            self.wx_is_night(days[0]['astronomy'][0], now_m))
+        area = (data.get('nearest_area') or [{}])[0]
+        place = ', '.join(x[0]['value'] for x in
+                          (area.get('areaName'), area.get('region')) if x)
+        # wttr.in reports its nearest station ("Tokyo" -> Shikinejima), so
+        # a typed place name wins; ZIPs / airport codes keep the station
+        loc = wx_location()
+        if re.search(r'[^\W\d_]', loc) and len(loc) > 3:
+            place = loc
+        self.wx_place = place
+        cur_t = int(cur['temp_F'])
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        for m in ('top', 'start', 'end'):
+            getattr(body, f'set_margin_{m}')(20)
+        body.set_margin_bottom(16)
+
+        # header: place (click to change) · updated · refresh
+        if self.wx_editing:
+            body.pack_start(self.wx_loc_editor(), False, False, 0)
+        else:
+            head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            pb = Gtk.Button()
+            pb.get_style_context().add_class('wxplacebtn')
+            pb.set_relief(Gtk.ReliefStyle.NONE)
+            pb.set_tooltip_text('Change location')
+            pb.connect('clicked', self.wx_start_edit)
+            pbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            pbox.pack_start(self._lbl('\U000F034E', 'wxpin'), False, False, 0)
+            ht = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            pl = self._lbl(place or 'Weather', 'wxplace')
+            pl.set_ellipsize(Pango.EllipsizeMode.END)
+            prow.pack_start(pl, False, False, 0)
+            prow.pack_start(self._lbl('\U000F0140', 'wxchev'), False, False, 0)
+            ht.pack_start(prow, False, False, 0)
+            try:
+                upd = time.strftime('%-I:%M %p',
+                                    time.localtime(os.path.getmtime(WX_CACHE)))
+            except OSError:
+                upd = '\u2014'
+            sub = 'Updating\u2026' if self.wx_fetching else (
+                f'Updated {upd}' + ('' if wx_location()
+                                    else '  \u00b7  auto-located'))
+            ht.pack_start(self._lbl(sub, 'wxdim'), False, False, 0)
+            pbox.pack_start(ht, True, True, 0)
+            pb.add(pbox)
+            head.pack_start(pb, True, True, 0)
+            rb = Gtk.Button(label='\U000F0450')
+            rb.get_style_context().add_class('wxicon')
+            rb.set_relief(Gtk.ReliefStyle.NONE)
+            rb.set_valign(Gtk.Align.CENTER)
+            rb.set_tooltip_text('Refresh')
+            rb.set_sensitive(not self.wx_fetching)
+            rb.connect('clicked', self.wx_refresh)
+            head.pack_end(rb, False, False, 0)
+            body.pack_start(head, False, False, 0)
+        if self.wx_error:
+            err = self._lbl('\U000F0026  ' + self.wx_error, 'wxerr')
+            err.set_ellipsize(Pango.EllipsizeMode.END)
+            body.pack_start(err, False, False, 0)
+
+        # hero: big glyph + temperature + summary
+        hero = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        g = self.wx_glyph(kind, 'wxhero')
+        hero.pack_start(g, False, False, 0)
+        hero.pack_start(self._lbl(f'{cur_t}°', 'wxtemp'), False, False, 0)
+        summ = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        summ.set_valign(Gtk.Align.CENTER)
+        desc = self._lbl(cur['weatherDesc'][0]['value'].strip(), 'wxdesc', 1.0)
+        desc.set_ellipsize(Pango.EllipsizeMode.END)
+        summ.pack_start(desc, False, False, 0)
+        summ.pack_start(self._lbl(f"Feels like {cur['FeelsLikeF']}°",
+                                  'wxsub', 1.0), False, False, 0)
+        summ.pack_start(self._lbl(
+            f"H {days[0]['maxtempF']}°  ·  L {days[0]['mintempF']}°",
+            'wxsub', 1.0), False, False, 0)
+        hero.pack_end(summ, True, True, 0)
+        body.pack_start(hero, False, False, 0)
+
+        # stat chips
+        astro = days[0]['astronomy'][0]
+        if not self.wx_is_night(astro, now_m):
+            sun_next = ('\U000F059B', 'Sunset', astro['sunset'])
+        else:
+            nxt = days[1] if now_m >= 720 and len(days) > 1 else days[0]
+            sun_next = ('\U000F059C', 'Sunrise',
+                        nxt['astronomy'][0]['sunrise'])
+        chips = Gtk.Grid()
+        chips.set_column_spacing(8)
+        chips.set_column_homogeneous(True)
+        for i, (glyph, name, val) in enumerate((
+                ('\U000F058E', 'Humidity', f"{cur['humidity']}%"),
+                ('\U000F059D', 'Wind',
+                 f"{cur['windspeedMiles']} mph {cur['winddir16Point']}"),
+                ('\U000F05A8', 'UV index', cur.get('uvIndex', '—')),
+                (sun_next[0], sun_next[1],
+                 sun_next[2].lstrip('0').replace(' ', ' ')))):
+            chip = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            chip.get_style_context().add_class('wxchip')
+            top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            top.pack_start(self._lbl(glyph, 'wxchipglyph'), False, False, 0)
+            top.pack_start(self._lbl(name, 'wxdim'), False, False, 0)
+            chip.pack_start(top, False, False, 0)
+            v = self._lbl(str(val), 'wxchipval')
+            v.set_ellipsize(Pango.EllipsizeMode.END)
+            chip.pack_start(v, False, False, 0)
+            chips.attach(chip, i, 0, 1, 1)
+        body.pack_start(chips, False, False, 0)
+
+        # hourly strip: now + the next 3-hour slots
+        slots = [('Now', kind, cur_t, None)]
+        for di, d in enumerate(days):
+            for h in d['hourly']:
+                hm = int(h['time']) // 100 * 60
+                if di == 0 and hm <= now_m:
+                    continue
+                night = self.wx_is_night(d['astronomy'][0], hm)
+                lbl = time.strftime('%-I %p', time.strptime(
+                    str(hm // 60), '%H'))
+                slots.append((lbl, self.wx_kind(h['weatherCode'], night),
+                              int(h['tempF']), int(h['chanceofrain'])))
+        slots = slots[:WX_HOURS]
+        sec = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        sec.pack_start(self._lbl('Hourly', 'wxhdr'), False, False, 0)
+        strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        strip.set_homogeneous(True)
+        strip.get_style_context().add_class('wxstrip')
+        for i, (lbl, k, t, rain) in enumerate(slots):
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            col.get_style_context().add_class('wxhour')
+            if i == 0:
+                col.get_style_context().add_class('now')
+            col.pack_start(self._lbl(lbl, 'wxdim', 0.5), False, False, 0)
+            col.pack_start(self.wx_glyph(k, 'wxsmall'), False, False, 0)
+            col.pack_start(self._lbl(f'{t}°', 'wxval', 0.5), False, False, 0)
+            r = self._lbl(f'\U000F058C{rain}%' if rain else ' ', 'wxrain', 0.5)
+            col.pack_start(r, False, False, 0)
+            strip.pack_start(col, True, True, 0)
+        sec.pack_start(strip, False, False, 0)
+        body.pack_start(sec, False, False, 0)
+
+        # daily rows with a temperature range bar
+        lo_all = min(int(d['mintempF']) for d in days)
+        hi_all = max(int(d['maxtempF']) for d in days)
+        sec = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        sec.pack_start(self._lbl(f'{len(days)}-day forecast', 'wxhdr'),
+                       False, False, 6)
+        for di, d in enumerate(days):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row.get_style_context().add_class('wxday')
+            dt = time.strptime(d['date'], '%Y-%m-%d')
+            name = ('Today', 'Tomorrow')[di] if di < 2 \
+                else time.strftime('%A', dt)
+            nl = self._lbl(name, 'wxval')
+            nl.set_size_request(78, -1)
+            row.pack_start(nl, False, False, 0)
+            mid = d['hourly'][min(4, len(d['hourly']) - 1)]
+            row.pack_start(self.wx_glyph(self.wx_kind(mid['weatherCode']),
+                                         'wxsmall'), False, False, 0)
+            rain = max(int(h['chanceofrain']) for h in d['hourly'])
+            row.pack_start(self._lbl(f'\U000F058C{rain}%' if rain else '',
+                                     'wxrain'), False, False, 0)
+            lo, hi = int(d['mintempF']), int(d['maxtempF'])
+            row.pack_end(self._lbl(f'{hi}°', 'wxval', 1.0), False, False, 0)
+            bar = Gtk.DrawingArea()
+            bar.set_size_request(WX_BAR_W, 6)
+            bar.set_valign(Gtk.Align.CENTER)
+            bar.connect('draw', self._wx_draw_bar, lo, hi, lo_all, hi_all,
+                        cur_t if di == 0 else None)
+            row.pack_end(bar, False, False, 0)
+            lol = self._lbl(f'{lo}°', 'wxsub', 1.0)
+            lol.set_size_request(30, -1)
+            row.pack_end(lol, False, False, 0)
+            sec.pack_start(row, False, False, 0)
+        body.pack_start(sec, False, False, 0)
+        card.pack_start(body, False, False, 0)
+
+        # footer
+        foot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        foot.get_style_context().add_class('wxfooter')
+        src = self._lbl('wttr.in', 'wxdim')
+        src.set_margin_start(20)
+        foot.pack_start(src, False, False, 0)
+        fb = Gtk.Button(label='Full forecast  \U000F03CC')
+        fb.get_style_context().add_class('wxlink')
+        fb.set_margin_end(12)
+        fb.connect('clicked', self._wx_open_full)
+        foot.pack_end(fb, False, False, 0)
+        card.pack_start(foot, False, False, 0)
+        card.show_all()
+
+    def _wx_open_full(self, *_):
+        q = urllib.parse.quote(wx_location() or (
+            self.wx_place.split(',')[0] if getattr(self, 'wx_place', '')
+            else ''))
+        subprocess.Popen(['xdg-open', f'https://wttr.in/{q}'],
+                         start_new_session=True)
+        self.wx_close()
+
+    @staticmethod
+    def _wx_temp_rgb(t):
+        """Cold blue → mild teal → warm amber → hot coral."""
+        stops = ((20, (0.45, 0.62, 1.00)), (50, (0.42, 0.85, 0.85)),
+                 (68, (0.55, 0.88, 0.55)), (82, (1.00, 0.80, 0.32)),
+                 (100, (1.00, 0.45, 0.35)))
+        if t <= stops[0][0]:
+            return stops[0][1]
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t <= t1:
+                f = (t - t0) / (t1 - t0)
+                return tuple(a + (b - a) * f for a, b in zip(c0, c1))
+        return stops[-1][1]
+
+    def _wx_draw_bar(self, area, cr, lo, hi, lo_all, hi_all, cur):
+        import cairo
+        import math
+        w = area.get_allocated_width()
+        h = area.get_allocated_height()
+        r = h / 2
+        span = max(1, hi_all - lo_all)
+
+        def rrect(x0, x1):
+            cr.new_sub_path()
+            cr.arc(x0 + r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(x1 - r, r, r, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+
+        rrect(0, w)
+        cr.set_source_rgba(1, 1, 1, 0.10)
+        cr.fill()
+        x0 = (lo - lo_all) / span * w
+        x1 = max(x0 + h, (hi - lo_all) / span * w)
+        grad = cairo.LinearGradient(x0, 0, x1, 0)
+        grad.add_color_stop_rgb(0, *self._wx_temp_rgb(lo))
+        grad.add_color_stop_rgb(1, *self._wx_temp_rgb(hi))
+        rrect(x0, x1)
+        cr.set_source(grad)
+        cr.fill()
+        if cur is not None:
+            cx = min(max((cur - lo_all) / span * w, r + 1), w - r - 1)
+            cr.arc(cx, r, r + 1, 0, 2 * math.pi)
+            cr.set_source_rgb(1, 1, 1)
+            cr.fill_preserve()
+            cr.set_line_width(1.5)
+            cr.set_source_rgba(0, 0, 0, 0.45)
+            cr.stroke()
+        return False
+
     def taskview_close(self):
         if self.tv_win:
             self.tv_win.destroy()
@@ -2726,19 +5601,19 @@ class Dock(Gtk.Window):
         # on our monitor's *currently visible* workspace. A game left
         # fullscreen on a background workspace must NOT hide the dock —
         # only fullscreen on the workspace we're actually looking at.
-        active_ws = None
-        for m in hyprctl('monitors', want_json=True) or []:
-            if m.get('id') == self.mon_id:
-                active_ws = m.get('activeWorkspace', {}).get('id')
-                break
-        fs = any(c.get('fullscreen') and c.get('monitor') == self.mon_id
-                 and c.get('workspace', {}).get('id') == active_ws
-                 and c.get('mapped', True) for c in clients)
-        if fs and self.get_visible():
-            self.close_preview()
-            self.hide()
-        elif not fs and not self.get_visible():
-            self.show()
+        active_ws = {m.get('id'): m.get('activeWorkspace', {}).get('id')
+                     for m in hyprctl('monitors', want_json=True) or []}
+        for s in self.strips:
+            fs = any(c.get('fullscreen') and c.get('monitor') == s.mon_id
+                     and c.get('workspace', {}).get('id')
+                     == active_ws.get(s.mon_id)
+                     and c.get('mapped', True) for c in clients)
+            if fs and s.get_visible():
+                if self.preview_strip is s:
+                    self.close_preview()
+                s.hide()
+            elif not fs and not s.get_visible():
+                s.show()
 
         if self.active_addr is None:
             aw = hyprctl('activewindow', want_json=True)
@@ -2754,7 +5629,7 @@ class Dock(Gtk.Window):
             cls = c.get('class') or ''
             if not cls or not c.get('mapped', True):
                 continue
-            info = self.resolver.resolve(cls)
+            info = self.resolver.resolve(cls, c.get('pid'))
             key = info.get_id() if info else cls.lower()
             g = groups.get(key)
             if g is None:
@@ -2792,29 +5667,33 @@ class Dock(Gtk.Window):
             if k not in self.order:
                 self.order.append(k)
 
-        for k in list(self.buttons):
-            if k not in self.groups:
-                if self.pop_key == k:
-                    self.close_preview()
-                self.box.remove(self.buttons.pop(k))
-
-        for idx, k in enumerate(self.order):
-            g = self.groups[k]
-            btn = self.buttons.get(k)
-            if btn is None:
-                btn = self.buttons[k] = self.create_button(k)
-                self.box.pack_start(btn, False, False, 0)
-            self.update_button(btn, g)
-            self.box.reorder_child(btn, idx)
-
-        self.box.show_all()
-        for btn in self.buttons.values():
-            btn._badge.set_visible(btn._n > 1)
+        if self.pop_key and self.pop_key not in self.groups:
+            self.close_preview()
+        for s in self.strips:
+            self._sync_strip(s)
 
         # live-update an open preview (signature-guarded, no flicker)
         if (self.pop_key and self.preview and self.preview.get_visible()
                 and self.pop_key in self.groups):
             self.fill_preview(self.groups[self.pop_key])
+
+    def _sync_strip(self, s):
+        for k in list(s.buttons):
+            if k not in self.groups:
+                s.box.remove(s.buttons.pop(k))
+
+        for idx, k in enumerate(self.order):
+            g = self.groups[k]
+            btn = s.buttons.get(k)
+            if btn is None:
+                btn = s.buttons[k] = self.create_button(k, s)
+                s.box.pack_start(btn, False, False, 0)
+            self.update_button(btn, g)
+            s.box.reorder_child(btn, idx)
+
+        s.box.show_all()
+        for btn in s.buttons.values():
+            btn._badge.set_visible(btn._n > 1)
 
     # ---------- icons ----------
     def gicon_for(self, g):
@@ -2822,11 +5701,8 @@ class Dock(Gtk.Window):
             icon = g['info'].get_icon()
             if icon:
                 return icon
-        theme = Gtk.IconTheme.get_default()
-        for cand in (g['cls'] or '', (g['cls'] or '').lower()):
-            if cand and theme.has_icon(cand):
-                return Gio.ThemedIcon.new(cand)
-        return Gio.ThemedIcon.new('application-x-executable')
+        icon = self.resolver.fallback_icon(g['cls']) if g['cls'] else None
+        return icon or Gio.ThemedIcon.new('application-x-executable')
 
     def icon_image(self, g, size):
         img = Gtk.Image.new_from_gicon(self.gicon_for(g), Gtk.IconSize.INVALID)
@@ -2834,8 +5710,9 @@ class Dock(Gtk.Window):
         return img
 
     # ---------- buttons ----------
-    def create_button(self, key):
+    def create_button(self, key, strip):
         btn = Gtk.Button()
+        btn._strip = strip
         btn.get_style_context().add_class('appbtn')
         btn.set_relief(Gtk.ReliefStyle.NONE)
         btn.set_focus_on_click(False)
@@ -2877,12 +5754,14 @@ class Dock(Gtk.Window):
         btn._n = n
         btn._group = g
 
-        if g['cls'] != btn._iconcls:
-            btn._iconcls = g['cls']
+        gicon = self.gicon_for(g)
+        if gicon.to_string() != btn._iconcls:
+            btn._iconcls = gicon.to_string()
             for ch in btn._iconslot.get_children():
                 btn._iconslot.remove(ch)
-            btn._iconslot.pack_start(self.icon_image(g, ICON_SIZE),
-                                     False, False, 0)
+            img = Gtk.Image.new_from_gicon(gicon, Gtk.IconSize.INVALID)
+            img.set_pixel_size(ICON_SIZE)
+            btn._iconslot.pack_start(img, False, False, 0)
 
         ctx = btn.get_style_context()
         is_active = any(w['address'] == self.active_addr
@@ -2922,6 +5801,7 @@ class Dock(Gtk.Window):
     # (GTK/Wayland DnD doesn't work from layer-shell surfaces, so we
     #  track the pointer ourselves and shuffle icons live.)
     def on_press(self, btn, event):
+        self.close_bar_popups()
         if event.button == 3:
             self.show_context_menu(btn, event)
             return True
@@ -2952,7 +5832,7 @@ class Dock(Gtk.Window):
         for i, k in enumerate(self.order):
             if k == btn._key:
                 continue
-            a = self.buttons[k].get_allocation()
+            a = btn._strip.buttons[k].get_allocation()
             center = a.x + a.width / 2
             if i < cur and px < center:
                 target = min(target, i)
@@ -2961,7 +5841,7 @@ class Dock(Gtk.Window):
         if target != cur:
             self.order.remove(btn._key)
             self.order.insert(target, btn._key)
-            self.box.reorder_child(btn, target)
+            btn._strip.box.reorder_child(btn, target)
         return True
 
     def on_release(self, btn, event):
@@ -2973,6 +5853,7 @@ class Dock(Gtk.Window):
             pinset = set(self.pinned)
             self.pinned = [k for k in self.order if k in pinset]
             self.save_pinned()
+            self.refresh()         # carry the new order to the other strips
             return True     # swallow the click that would follow
         return False
 
@@ -3073,17 +5954,20 @@ class Dock(Gtk.Window):
                 break
             if cls and (g.get('cls') or '').lower() == cls.lower():
                 key = k
-        btn = self.buttons.get(key) if key else None
+        c = self.clients_by_addr.get(addr) or {}
+        s = next((s for s in self.strips
+                  if s.mon_id == c.get('monitor') and s.get_visible()), self)
+        btn = s.buttons.get(key) if key else None
         size = MIN_ANIM_SIZE
         if btn is not None:
             a = btn.get_allocation()
             # layer-shell dock: left margin + icon offset, sitting on bottom
-            cx = self.mon_x + MARGIN_LEFT + a.x + a.width // 2
-            cy = self.mon_y + self.mon_h - BAR_HEIGHT // 2
+            cx = s.mon_x + MARGIN_LEFT + a.x + a.width // 2
+            cy = s.mon_y + s.mon_h - BAR_HEIGHT // 2
             return (int(cx - size // 2), int(cy - size // 2), size, size)
         # fallback: center of the taskbar strip
-        cx = self.mon_x + self.mon_w // 2
-        cy = self.mon_y + self.mon_h - BAR_HEIGHT // 2
+        cx = s.mon_x + s.mon_w // 2
+        cy = s.mon_y + s.mon_h - BAR_HEIGHT // 2
         return (int(cx - size // 2), int(cy - size // 2), size, size)
 
     def _set_geom(self, addr, x, y, w, h, animate=True):
@@ -3509,6 +6393,7 @@ class Dock(Gtk.Window):
         LS.set_namespace(w, 'winbar-preview')
         if self.gdk_mon:
             LS.set_monitor(w, self.gdk_mon)
+        self.preview_strip = self
 
         visual = w.get_screen().get_rgba_visual()
         if visual:
@@ -3601,6 +6486,13 @@ class Dock(Gtk.Window):
         if not g['windows']:
             return
         self.ensure_preview()
+        strip = btn._strip
+        if strip is not self.preview_strip:
+            # a mapped layer surface can't change outputs: remap it there
+            self.preview.hide()
+            if strip.gdk_mon:
+                GtkLayerShell.set_monitor(self.preview, strip.gdk_mon)
+            self.preview_strip = strip
         self.pop_key = btn._key
         self.fill_preview(g)
 
@@ -3608,7 +6500,7 @@ class Dock(Gtk.Window):
         pw = self.preview.get_preferred_width()[1]
         a = btn.get_allocation()
         left = MARGIN_LEFT + a.x + a.width // 2 - pw // 2
-        left = max(8, min(left, self.mon_w - pw - 8))
+        left = max(8, min(left, strip.mon_w - pw - 8))
         GtkLayerShell.set_margin(self.preview, GtkLayerShell.Edge.LEFT,
                                  int(left))
         self.preview.show_all()
@@ -3788,5 +6680,6 @@ if __name__ == '__main__':
     if not os.environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
         sys.exit('winbar-dock: not inside a Hyprland session')
     install_theme_signal_handlers()
+    install_theme_file_monitors()
     Dock()
     Gtk.main()

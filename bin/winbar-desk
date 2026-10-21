@@ -21,7 +21,9 @@
 import ctypes
 import json
 import os
+import socket
 import sys
+import time
 
 try:
     libc = ctypes.CDLL('libc.so.6')
@@ -119,6 +121,32 @@ window { background: transparent; }
     margin: 4px 6px;
 }
 """
+
+
+# ---- relay empty-desktop pointer activity to walld ----
+# This layer covers the wallpaper, so the compositor never gives walld the
+# pointer. Interactive (web) wallpapers get it from us instead; walld reads
+# the position from Hyprland, so only the action is sent.
+WALLD_SOCK = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'walld.sock')
+_wall_move_t = 0.0
+
+
+def wall_pointer(line):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.05)
+            s.connect(WALLD_SOCK)
+            s.sendall(f'pointer {line}\n'.encode())
+    except OSError:
+        pass   # walld not running
+
+
+def wall_pointer_move():
+    global _wall_move_t
+    now = time.monotonic()
+    if now - _wall_move_t >= 0.008:   # ~120 Hz is plenty for a 60 fps page
+        _wall_move_t = now
+        wall_pointer('move')
 
 
 def launch_path(path):
@@ -277,11 +305,16 @@ class DeskWindow(Gtk.Window):
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
                         | Gdk.EventMask.BUTTON_RELEASE_MASK
                         | Gdk.EventMask.BUTTON1_MOTION_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK
+                        | Gdk.EventMask.SCROLL_MASK
+                        | Gdk.EventMask.LEAVE_NOTIFY_MASK
                         | Gdk.EventMask.KEY_PRESS_MASK)
         self.connect('button-press-event', self.on_bg_press)
         self.connect('motion-notify-event', self.on_bg_motion)
         self.connect('button-release-event', self.on_bg_release)
         self.connect('key-press-event', self.on_key)
+        self.connect('scroll-event', self.on_bg_scroll)
+        self.connect('leave-notify-event', self.on_bg_leave)
         # draw the rubber-band rectangle (behind icons); return False so
         # the default handler still draws the Fixed's icon children on top
         self.connect('draw', self.on_draw)
@@ -566,6 +599,8 @@ class DeskWindow(Gtk.Window):
     # ---------- background interactions ----------
     def on_bg_press(self, _w, event):
         # only reach here when clicking empty space (icons handle theirs)
+        if event.type == Gdk.EventType.BUTTON_PRESS:
+            wall_pointer(f'down {event.button}')
         self.grab_focus()   # take keyboard focus for arrow/Del/F2 nav
         if event.button == 1:
             self.clear_selection()
@@ -577,6 +612,8 @@ class DeskWindow(Gtk.Window):
         return False
 
     def on_bg_motion(self, _w, event):
+        if not self.dragging:
+            wall_pointer_move()
         if not self.band_active:
             return False
         x0, y0 = self.band_start
@@ -589,6 +626,7 @@ class DeskWindow(Gtk.Window):
         return True
 
     def on_bg_release(self, _w, event):
+        wall_pointer(f'up {event.button}')
         if event.button == 3:
             self.bg_menu(event)
             return False
@@ -597,6 +635,22 @@ class DeskWindow(Gtk.Window):
         self.band_active = False
         self.band_rect = None
         self.queue_draw()
+        return False
+
+    def on_bg_scroll(self, _w, event):
+        ok, dx, dy = event.get_scroll_deltas()
+        if not ok:
+            dx, dy = {Gdk.ScrollDirection.UP: (0, -1),
+                      Gdk.ScrollDirection.DOWN: (0, 1),
+                      Gdk.ScrollDirection.LEFT: (-1, 0),
+                      Gdk.ScrollDirection.RIGHT: (1, 0)}.get(event.direction, (0, 0))
+        wall_pointer(f'wheel {dx * 100:.1f} {dy * 100:.1f}')
+        return False
+
+    def on_bg_leave(self, _w, event):
+        # entering an icon's own window is not leaving the desktop
+        if event.detail != Gdk.NotifyType.INFERIOR:
+            wall_pointer('leave')
         return False
 
     def band_select(self, rx, ry, rw, rh):
