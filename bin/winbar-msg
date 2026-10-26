@@ -9,8 +9,8 @@
 #   weather-location                (weather flyout, location picker open)
 #   net | clock                     (internet / calendar flyouts)
 # Falls back to plain hyprland cycling if the dock isn't running.
-# The start menu itself lives in winbar-dock now; the rofi fallback
-# below only fires when the dock is dead, as a way back in.
+# The start menu lives in winbar-dock; with no dock running, `start`
+# opens it standalone via ~/.local/bin/winbar-start instead.
 import os
 import socket
 import subprocess
@@ -32,10 +32,16 @@ except OSError:
         subprocess.run(['hyprctl', 'dispatch', 'cyclenext', 'prev'])
         subprocess.run(['hyprctl', 'dispatch', 'alterzorder', 'top'])
     elif cmd == 'start':
-        subprocess.Popen(
-            [os.path.expanduser('~/.local/bin/rofi-apps'),
-             '-show', 'combi', '-theme',
-             os.path.expanduser('~/.config/rofi/winmode-start.rasi')])
+        # No dock (normal mode / bar hidden): the standalone menu. A live
+        # one toggles itself closed; otherwise start one.
+        try:
+            s.sendto(b'start', os.path.join(os.path.dirname(sock_path),
+                                            'winbar-start.sock'))
+        except OSError:
+            subprocess.Popen(
+                ['setsid', '-f', os.path.expanduser('~/.local/bin/winbar-start')],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
     elif cmd == 'weather':
         subprocess.Popen(['xdg-open', 'https://wttr.in'])
     # minimize has no sensible fallback outside winmode / dock

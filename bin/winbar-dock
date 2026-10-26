@@ -276,6 +276,10 @@ PINNED_FILE = os.path.join(CONFIG_DIR, 'pinned.json')
 THUMB_DIR = os.path.expanduser('~/.cache/winbar/thumbs')
 RUNTIME_DIR = os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')
 CTRL_SOCK = os.path.join(RUNTIME_DIR, 'winbar-dock.sock')
+# Run as `winbar-start` (a symlink to this script) to get just the start
+# menu, for when the dock isn't up: normal mode, or the bar hidden.
+START_ONLY = os.path.basename(sys.argv[0]) == 'winbar-start'
+START_SOCK = os.path.join(RUNTIME_DIR, 'winbar-start.sock')
 TRAY_FILE = os.path.join(CONFIG_DIR, 'tray-apps.json')
 ART_DIR = os.path.expanduser('~/.cache/winbar/art')
 # "Add to desktop" drops a .desktop copy here; winbar-desk's folder
@@ -1588,6 +1592,10 @@ class Dock(Gtk.Window):
         # minimized windows: addr -> {workspace, ws_name}
         self.minimized = self.load_minimized()
 
+        if START_ONLY:
+            self._start_only_init()
+            return
+
         os.makedirs(THUMB_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(MINIMIZED_FILE), exist_ok=True)
         for f in os.listdir(THUMB_DIR):   # stale thumbs from last session
@@ -1660,6 +1668,25 @@ class Dock(Gtk.Window):
         self.refresh()
         self.show_all()
         GLib.timeout_add(600, self._capture_active_thumb)  # first snapshot
+
+    def _start_only_init(self):
+        """winbar-start: no strip, no events, just the menu. A second
+        Super+R reaches us over START_SOCK and closes it; closing exits."""
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            self.get_screen(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        load_theme_css()
+        try:
+            os.unlink(START_SOCK)
+        except OSError:
+            pass
+        self.ctrl_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.ctrl_sock.bind(START_SOCK)
+        self.ctrl_sock.setblocking(False)
+        GLib.io_add_watch(self.ctrl_sock.fileno(), GLib.IO_IN, self.on_ctrl)
+        self.start_toggle()
 
     # ---------- pinned persistence ----------
     def load_pinned(self):
@@ -2439,16 +2466,22 @@ class Dock(Gtk.Window):
             self.start_win.destroy()
             self.start_win = None
         self.st = {}
+        if START_ONLY:
+            # give a just-launched app a moment to detach before we go
+            self._quit_id = GLib.timeout_add(1500, Gtk.main_quit)
 
     def start_toggle(self):
         if self.start_win:
             self.start_close()
             return
+        if START_ONLY and getattr(self, '_quit_id', None):
+            GLib.source_remove(self._quit_id)   # reopened before exiting
+            self._quit_id = None
         self.close_bar_popups()
         self.st = {}
         self.start_pinned = self.load_start_pinned()
         w = self._backdrop('winbar-start', self.start_close,
-                           spare_bar=True)
+                           spare_bar=not START_ONLY)
         # EXCLUSIVE (not ON_DEMAND): the menu opens from a taskbar click,
         # so it has to take the keyboard itself or search can't be typed.
         if hasattr(GtkLayerShell, 'set_keyboard_mode'):
